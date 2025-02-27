@@ -8,35 +8,42 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import time
 import xml.etree.ElementTree as ET
-from transforms3d.euler import euler2quat
+import traceback
 
-from rotations import Quaternion, skew_symmetric, angle_normalize, omega
+# Camera Settings
+BASELINE = 0.4
+FOV = 90
+IMAGE_HEIGHT = 720
+IMAGE_WIDTH = 1280
 
-np.set_printoptions(precision = 5, suppress = True)
+# Stereo Matching Algorithms
+# Choose either between "BM" or "SGBM"
+STEREO_MATCHER = "SGBM"
 
-# Sensor sampling frequency
-IMU_FREQ = 200
-GNSS_FREQ = 50
+# Depth Map Settings
+NDISP_FACTOR = 6 # Adjust this; disparity search range for computing depth map
+MIN_DISPARITY = 0
+NUM_DISPARITIES = 16*NDISP_FACTOR - MIN_DISPARITY
+BLOCKSIZE = 11
+WINDOWSIZE = 6
 
-# Sensor noise variances
-VAR_IMU_ACC = 0.001
-VAR_IMU_GYRO = 0.001
-VAR_GNSS = np.eye(3) * 100
+# Motion Estimation Settings
+# For each pixel with a depth LESS than S_LIMIT, we will compute the coordinate of that point in
+# the camera coordinate system, and use those points to estimate the motion.
+S_LIMIT = 100
 
-# Sensor noise profile
-NOISE_STDDEV = 5e-6
-NOISE_BIAS = 1e-6
+# Display settings
+SHOW_PLOTS = True
+SHOW_LR_CAMERAS = True
+SHOW_DEPTHS = True
+VISUALIZE_MATCHES = True
 
-# Initial state covariance
-POS_VAR = 1
-ORIENTATION_VAR = 1000
-VELOCITY_VAR = 1000
-
-# Earth radius
-EARTH_RADIUS_EQUA = 6378137.0
-
-# Number of GNSS measurements to use for initialization
-NUM_MEASUREMENTS = 10
+# Plot Settings
+PLOT_3D = True
+PLOT_XY = True
+PLOT_XZ = True
+PLOT_YZ = True
+NUM_PLOTS = sum([PLOT_3D, PLOT_XY, PLOT_XZ, PLOT_YZ])
 
 # Initialize world
 client = carla.Client('localhost', 2000)
@@ -56,368 +63,467 @@ def update_spectator(spectator):
 spawn_point = random.choice(world.get_map().get_spawn_points())
 bp = world.get_blueprint_library()
 vehicle_bp = bp.filter('model3')[0]
-imu_bp = bp.filter('sensor.other.imu')[0]
-gnss_bp = bp.filter('sensor.other.gnss')[0]
-
-# Set sensor noise
-imu_bp.set_attribute('noise_accel_stddev_x', str(NOISE_STDDEV))
-imu_bp.set_attribute('noise_accel_stddev_y', str(NOISE_STDDEV))
-imu_bp.set_attribute('noise_accel_stddev_z', str(NOISE_STDDEV))
-imu_bp.set_attribute('noise_gyro_stddev_x', str(NOISE_STDDEV))
-imu_bp.set_attribute('noise_gyro_stddev_y', str(NOISE_STDDEV))
-imu_bp.set_attribute('noise_gyro_stddev_z', str(NOISE_STDDEV))
-imu_bp.set_attribute('noise_gyro_bias_x', str(NOISE_BIAS))
-imu_bp.set_attribute('noise_gyro_bias_y', str(NOISE_BIAS))
-imu_bp.set_attribute('noise_gyro_bias_z', str(NOISE_BIAS))
-gnss_bp.set_attribute('noise_alt_stddev', str(NOISE_STDDEV))
-gnss_bp.set_attribute('noise_lat_stddev', str(NOISE_STDDEV))
-gnss_bp.set_attribute('noise_lon_stddev', str(NOISE_STDDEV))
-gnss_bp.set_attribute('noise_alt_bias', str(NOISE_BIAS))
-gnss_bp.set_attribute('noise_lat_bias', str(NOISE_BIAS))
-gnss_bp.set_attribute('noise_lon_bias', str(NOISE_BIAS))
-
-# Set sensor sampling frequency
-imu_bp.set_attribute('sensor_tick', str(1.0/IMU_FREQ))
-gnss_bp.set_attribute('sensor_tick', str(1.0/GNSS_FREQ))
 
 # Spawn vehicle and sensors
 vehicle = world.spawn_actor(vehicle_bp, spawn_point)
-vehicle.set_autopilot(True)
+# vehicle.set_autopilot(True)
 
-imu = world.spawn_actor(
-    blueprint = imu_bp,
-    transform = carla.Transform(carla.Location(x = 0, z = 0)),
-    attach_to = vehicle
-)
-gnss = world.spawn_actor(
-    blueprint = gnss_bp,
-    transform = carla.Transform(carla.Location(x = 0, z = 0)),
-    attach_to = vehicle
-)
+# Append vehicle to list of actors
+actors = []
+actors.append(vehicle)
 
-# Keep the sensor readings from the callback to queues
-imu_queue = Queue()
-gnss_queue = Queue()
+# Add left and right cameras
+camera_bp = bp.find('sensor.camera.rgb')
 
-# Hook sensor readings to callback methods
-imu.listen(lambda data: imu_queue.put(data))
-gnss.listen(lambda data: gnss_queue.put(data))
+camera_bp.set_attribute("image_size_x", str(IMAGE_WIDTH))
+camera_bp.set_attribute("image_size_y", str(IMAGE_HEIGHT))
+camera_bp.set_attribute("fov", str(FOV))
 
-# Initializing vehicle states
-p_est = np.zeros([3,1])
-v_est = np.zeros([3,1])
-q_est = np.zeros([4,1]) # Quaternion
+# camera_bp.set_attribute('fov', str(FOV))
+left_camera_transform = carla.Transform(carla.Location(x=2, y=-BASELINE/2, z=1.4))
+right_camera_transform = carla.Transform(carla.Location(x=2, y=BASELINE/2, z=1.4))
+left_camera = world.spawn_actor(camera_bp, left_camera_transform, attach_to=vehicle)
+right_camera = world.spawn_actor(camera_bp, right_camera_transform, attach_to=vehicle)
 
-# Initializing state covariance
-p_cov_est = np.zeros([9,9])
+# Append cameras to list of actors
+actors.append(left_camera)
+actors.append(right_camera)
 
-# Gravity
-g = np.array([0, 0, -9.81]).reshape(3,1) # gravity
+# Build the K Projection Matrix
+# K = [[Fx 0 image_width/2],
+#      [0 Fy image_height/2],
+#      [0 0 1]]
+# Fx and Fy are the same because the pixel aspect ratio is 1
 
-# Motion model noise Jacobian
-L_jac = np.zeros([9,6]) 
-L_jac[3:, :] = np.eye(6)
+image_width = camera_bp.get_attribute("image_size_x").as_int()
+image_height = camera_bp.get_attribute("image_size_y").as_int()
+fov = camera_bp.get_attribute("fov").as_float()
+focal = image_width / (2.0 * np.tan(fov * np.pi / 360.0))
 
-# Measurement model Jacobian
-H_jac = np.zeros([3,9]) 
-H_jac[:, :3] = np.eye(3) 
+K = np.array([[focal, 0,     image_width / 2.0],
+              [0,     -focal, image_height / 2.0],
+              [0,     0,     1]])
 
-# Initialize lists for plotting
-x_gt_data = []
-y_gt_data = []
-x_est_data = []
-y_est_data = []
+# sensor_queue = Queue()
+# def process_image(sensor_data, sensor_name, sensor_queue):
+#     frame = np.array(sensor_data.raw_data, dtype=np.uint8)
+#     frame = np.reshape(frame, (sensor_data.height, sensor_data.width, 4))[...,:3]
+#     sensor_queue.put((frame, sensor_name))
 
-# Initialize plot
-plt.ion()
-fig, ax1 = plt.subplots(figsize=(10,6))
-ax1.set_title("Ego Vehicle Position")
-p_gt_line, = ax1.plot([], [], label = "Ground Truth", color = "r")
-p_est_line, = ax1.plot([], [], label = "Estimated", color = "g")
-ax1.legend()
-plt.grid()
+camera_data = {'left': np.zeros((image_height, image_width, 3), dtype=np.uint8),
+               'right': np.zeros((image_height, image_width, 3), dtype=np.uint8)}
 
-# Initialize the estimated coordinates using GNSS measurements
-gnss_init_xyz = None
-num_init_measurements = 0
-ekf_initialized = False
+def l_camera_callback(image, data_dict):
+    array = np.frombuffer(image.raw_data, dtype=np.uint8)
+    array = np.reshape(array, (image.height, image.width, 4))
+    data_dict['left'] = array[..., :3]  # Keep only RGB channels
 
-def init_state_from_gnss(gnss_data, gnss_init_xyz, num_init_measurements):
+def r_camera_callback(image, data_dict):
+    array = np.frombuffer(image.raw_data, dtype=np.uint8)
+    array = np.reshape(array, (image.height, image.width, 4))
+    data_dict['right'] = array[..., :3]  # Keep only RGB channels
+
+left_camera.listen(lambda image: l_camera_callback(image, camera_data))
+right_camera.listen(lambda image: r_camera_callback(image, camera_data))
+
+def compute_disparity(img_left, img_right):
     """
-    Initialize the vehicle state by taking the average of NUM_MEASUREMENTS readings from GNSS
-    to get the abosolute position of the vehicle
+    Compute disparity between left and right images
+
+    numDisparities: number of disparities to search
+        since numDisparities is set to 96, the maximum possible disparity is 96
+    blockSize: size of the block used for matching.
+        A larger block size can smooth out noise but may lose fine details
+    P1 and P2: parameters used in the disparity transform
+        P1: penalty for small disparity changes
+        P2: penalty for large disparity changes
+    mode: mode of the disparity transform
     """
-    if gnss_init_xyz is None:
-        # If this is the first GNSS reading, initialize the state to the GNSS reading
-        gnss_init_xyz = np.array([gnss_data[0],
-                                  gnss_data[1],
-                                  gnss_data[2]])
-    else:
-        # Otherwise, add the GNSS reading to the array
-        gnss_init_xyz[0] += gnss_data[0]
-        gnss_init_xyz[1] += gnss_data[1]
-        gnss_init_xyz[2] += gnss_data[2]
-    # Increment the number of GNSS measurements taken
-    num_init_measurements += 1
-    # print("Number of GNSS measurements taken: ", num_init_measurements)	
-    # print("gnss_init_xyz: ", gnss_init_xyz)
-    return gnss_init_xyz, ekf_initialized, num_init_measurements
+    img_left_grayscale = cv2.cvtColor(img_left, cv2.COLOR_BGR2GRAY)
+    img_right_grayscale = cv2.cvtColor(img_right, cv2.COLOR_BGR2GRAY)
 
-def _get_latlon_ref():
+    if STEREO_MATCHER == "BM":
+        stereo = cv2.StereoBM.create(numDisparities=16*NDISP_FACTOR, blockSize=15)
+    elif STEREO_MATCHER == "SGBM":
+        stereo = cv2.StereoSGBM_create(minDisparity = MIN_DISPARITY,
+                                       numDisparities = NUM_DISPARITIES,
+                                       blockSize = BLOCKSIZE,
+                                       P1 = 8*3*WINDOWSIZE**2,
+                                       P2 = 32*3*WINDOWSIZE**2,
+                                       disp12MaxDiff = 1,
+                                       uniquenessRatio = 15,
+                                       speckleWindowSize = 0,
+                                       speckleRange = 2,
+                                       preFilterCap = 63,
+                                       mode = cv2.STEREO_SGBM_MODE_SGBM_3WAY)
+    disparity = stereo.compute(img_left_grayscale, img_right_grayscale).astype(np.float32)/16
+    # .compute method caculates the disparity map for the left image using the SGBM matcher
+    # The result is divided by 16 to convert it from fixed-point (used by CV2) to floating point
+
+    return disparity
+
+def calculate_depth(img_left, img_right, K):
     """
-    Convert from waypoints world coordinates to CARLA GPS coordinates
-    :return: tuple with lat and lon coordinates
-    https://github.com/carla-simulator/scenario_runner/blob/master/srunner/tools/route_manipulation.py
+    Computes a depth map from the disparity
+
+    focal: focal length of the camera
+    baseline: distance between the left and right cameras
+
+    Depth formula: depth = focal_length * baseline / disparity
     """
-    xodr = world.get_map().to_opendrive()
-    tree = ET.ElementTree(ET.fromstring(xodr))
+    disparity = compute_disparity(img_left, img_right)
+    focal = K[0,0]
 
-    # default reference
-    lat_ref = 42.0
-    lon_ref = 2.0
+    # Replace all instances of 0 and -1 with a small minimum value (to avoid div by 0 or negatives)
+    disparity[disparity == 0] = 0.0001
+    disparity[disparity == -1] = 0.0001
 
-    for opendrive in tree.iter("OpenDRIVE"):
-        for header in opendrive.iter("header"):
-            for georef in header.iter("geoReference"):
-                if georef.text:
-                    str_list = georef.text.split(' ')
-                    for item in str_list:
-                        if '+lat_0' in item:
-                            lat_ref = float(item.split('=')[1])
-                        if '+lon_0' in item:
-                            lon_ref = float(item.split('=')[1])
-    return lat_ref, lon_ref
-gnss_lat_ref, gnss_lon_ref = _get_latlon_ref()
+    # Initialize the depth map as an array of ones with the same shape as the disparity map
+    # data type is np.single (32-bit floating point)
+    depth = np.ones(disparity.shape, np.single)
+    depth = (focal * BASELINE) / disparity
+    return depth
 
-def gnss_to_xyz(latitude, longitude, altitude):
-    """Creates Location from GPS (latitude, longitude, altitude).
-    This is the inverse of the _location_to_gps method found in
-    https://github.com/carla-simulator/scenario_runner/blob/master/srunner/tools/route_manipulation.py
+def extract_features(image):
+    """
+    Extracts keypoints and descriptors from an image
+
+    ORB: Oriented FAST and Rotated BRIEF feature detector and descriptor
+    """
+    # ORB detector initialized usinng ORB_create
+    orb = cv2.ORB_create(nfeatures=1500)
+
+    # Find the keypoints and descriptors with ORB
+    keypoints, descriptors = orb.detectAndCompute(image, None)
+
+    return keypoints, descriptors
+
+def match_features(descriptors1, descriptors2):
+    """
+    Matches features between two images
     
-    Modified from:
-    https://github.com/erdos-project/pylot/blob/master/pylot/utils.py
+    BFMatcher: Brute Force Matcher
     """
-    scale = math.cos(gnss_lat_ref * math.pi / 180.0)
-    basex = scale * math.pi * EARTH_RADIUS_EQUA / 180.0 * gnss_lon_ref
-    basey = scale * EARTH_RADIUS_EQUA * math.log(
-        math.tan((90.0 + gnss_lat_ref) * math.pi / 360.0))
+    bfmatcher = cv2.BFMatcher()
+    matches = bfmatcher.knnMatch(descriptors1, descriptors2, k=2)
+    return matches
 
-    x = scale * math.pi * EARTH_RADIUS_EQUA / 180.0 * longitude - basex
-    y = scale * EARTH_RADIUS_EQUA * math.log(
-        math.tan((90.0 + latitude) * math.pi / 360.0)) - basey
-
-    # This wasn't in the original method, but seems to be necessary.
-    y *= -1
-
-    return np.array([x, y, altitude]).reshape(3, 1)
-
-def get_sensor_readings(frame):
+def filter_matches_by_distance(matches, dist_threshold):
     """
-    This function returns the sensor readings at a particular frame
+    Filters matches by distance
+
+    matches: list of matched features from two images
+    dist_threshold: maximum allowed relative distance betwween the two matches: (0, 1)
+
+    filtered_matches: list of good matches, satisfying the distance threshold
     """
-    sensors = {'imu': None, 
-               'gnss': None}
-    while not imu_queue.empty():
-        imu_data = imu_queue.get()
-        if imu_data.frame == frame:
-            sensors['imu'] = imu_data
-            imu_queue.task_done()
-            break
-        imu_queue.task_done()
-    while not gnss_queue.empty():
-        gnss_data = gnss_queue.get()
-        if gnss_data.frame == frame:
-            alt = gnss_data.altitude
-            lat = gnss_data.latitude
-            lon = gnss_data.longitude
-            gps_xyz = gnss_to_xyz(lat, lon, alt)
-            sensors['gnss'] = gps_xyz
-            gnss_queue.task_done()
-            break
-        gnss_queue.task_done()
-    return sensors
+    filtered_matches = [match1 for match1, match2 in matches if match1.distance < (dist_threshold * match2.distance)]
+    # filtered_match = []
+    # for i, (match1, match2) in enumerate(matches):
+    #     if match1.distance < dist_threshold:
+    #         filtered_match.append(match1)
 
-def carla_rotation_to_RPY(carla_rotation):
-    roll = math.radians(carla_rotation.roll)
-    pitch = -math.radians(carla_rotation.pitch)
-    yaw = -math.radians(carla_rotation.yaw)
-    return (roll, pitch, yaw)
+    return filtered_matches
 
-def carla_rotation_to_ros_quaternion(carla_rotation):
-    roll, pitch, yaw = carla_rotation_to_RPY(carla_rotation)
-    quat = euler2quat(roll, pitch, yaw)
-    return quat
+def estimate_motion(matches, keypoints1, keypoints2, K, depth=None):
+    """
+    Estimates the relative motion (rotation and translation) between two consecutive frames
+    using matched keypoints and optionally depth information
+    
+    Inputs:
+    - matches: a list of matches between keypoints in the two images
+    - keypoints1: keypoints in the first image
+    - keypoints2: keypoints in the second image
+    - K: camera intrinsic matrix
+    - depth: depth map for the first image (optional)
+    
+    Outputs:
+    - R: rotation matrix
+    - T: translation vector
+    """
+    # image_1_points and image_2_points are lists of 2D points in the first and second images, respectively
+    # object_points is a list of 3D points in the world coordinate system
+    image_1_points = []
+    image_2_points = []
+    object_points = []
 
-def predict_state(imu_f, imu_w, delta_t, p_est, v_est, q_est, p_cov_est):
-    # vfa = VAR_IMU_ACC**2
-    # vfw = VAR_IMU_GYRO**2
-    # Q_km = delta_t**2 * np.diag([vfa,vfa,vfa,vfw,vfw,vfw])
+    for m in matches:
+        # Extract coordinates (u1, v1) of the keypoint in the first image
+        # Extract coordinates (u2, v2) of the keypoint in the second image
+        # .queryIdx: index of the keypoint in the first image
+        # .trainIdx: index of the keypoint in the second image
+        u1, v1 = keypoints1[m.queryIdx].pt
+        u2, v2 = keypoints2[m.trainIdx].pt
 
-    C_ns = Quaternion(*q_est).to_mat()
-    p_est = p_est + delta_t * v_est + 0.5 * delta_t * delta_t * (C_ns @ imu_f + g)
-    v_est = v_est + delta_t * (C_ns @ imu_f + g)
-    q_est = Quaternion(axis_angle = imu_w * delta_t).quat_mult_right(q_est)
-    # q_est = omega(imu_w, delta_t) @ q_est
+        # Retrieve the depth value "s" at coordinates (u1, v1) from the depth map
+        s = depth[int(v1), int(u1)]
 
-    # Update covariance
-    F_k = np.eye(9)
-    F_k[:3,3:6] = np.eye(3) * delta_t
-    # F_k[3:6,6:9] = skew_symmetric(np.dot(C_ns, imu_f.reshape(3,1)))
-    F_k[3:6,6:] = -skew_symmetric(C_ns @ imu_f.reshape(3,1)) * delta_t
+        # If the depth value "s" is LESS than 1000:
+        if s < S_LIMIT:
+            # Compute the 3D point in the camera coordinate system using the formula:
+            # p_c = K^{-1} * (s * [u1, v1, 1]^T)
+            p_c = np.linalg.inv(K) @ (s * np.array([u1, v1, 1]))
 
-    Q_km = np.eye(6)
-    Q_km[3:,:3] *= delta_t * delta_t * VAR_IMU_ACC
-    Q_km[:3,3:] *= delta_t * delta_t * VAR_IMU_GYRO
+            # Append the 2D points and the computed 3D point to their respective lists
+            image_1_points.append(np.array([u1, v1]))
+            image_2_points.append(np.array([u2, v2]))
+            object_points.append(p_c)
 
-    L_k = np.zeros((9,6))
-    # L_k[3:6,0:3] = np.eye(3)
-    # L_k[6:9,3:6] = np.eye(3)
-    L_k[3:,:] = np.eye(6)
+    # Estimate the relative motion between the two images using RANSAC
+    # Stack the 3D points into a single NumPy array
+    object_points = np.vstack(object_points)
+    # Convert the 2D points into a single NumPy array
+    image_points = np.array(image_2_points)
+    # Estimate the rotation (R_vec) and translation (T) between the two frames using 
+    # the PnP algorithm with RANSAC
+    _, R_vec, T, _ = cv2.solvePnPRansac(object_points, image_points, K, None)
+    # Using Rodrigues' formula, convert the rotation vector to a rotation matrix
+    R, _ = cv2.Rodrigues(R_vec)
 
-    # Propagate uncertainty
-    p_cov_est = F_k @ p_cov_est @ F_k.T + L_k @ Q_km @ L_k.T
-    return p_est, v_est, q_est, p_cov_est
+    return R, T
 
-def correct_state(gnss_data, p_est, v_est, q_est, p_cov_est):
-    # Global position
-    gnss_x = gnss_data[0]
-    gnss_y = gnss_data[1]
-    gnss_z = gnss_data[2]
-    y_k = np.array([gnss_x, gnss_y, gnss_z])
+def update_trajectory(prev_trajectory, prev_RT, matches, keypoints1, keypoints2, K, depth=None):
+    # Extract each column of prev_trajectory and store it as a list of 3D points
+    # Example:
+    # prev_trajectory = np.array([
+    #                            [1, 2, 3, 4],   # x-coordinates
+    #                            [5, 6, 7, 8],   # y-coordinates
+    #                            [9, 10, 11, 12] # z-coordinates
+    #                            ])
+    # trajectory = np.array([
+    #                       [1, 5, 9],  
+    #                       [2, 6, 10],  
+    #                       [3, 7, 11],  
+    #                       [4, 8, 12] 
+    #                       )
+    trajectory = [prev_trajectory[:,i] for i in range(prev_trajectory.shape[-1])]
 
-    # Compute Kalman Gain
-    K_k = p_cov_est @ H_jac.T @ np.linalg.inv(H_jac @ p_cov_est @ H_jac.T + VAR_GNSS)
+    # Estimate the relative motion (rotation and translation) between two frames
+    R, T = estimate_motion(matches, keypoints1, keypoints2, K, depth=depth)
+    # R = 3x3, T = 3x1
 
-    # Compute error state
-    delta_x = K_k @ (y_k - p_est)
+    # Extrinsic matrix from previous frame (camera) to world frame
+    RT_prevframe_world = prev_RT
 
-    # Correct predicted state
-    delta_p = delta_x[:3]
-    delta_v = delta_x[3:6]
-    delta_phi_normalized = angle_normalize(delta_x[6:])
+    # Combine the rotation matrix (R) and translation vector (T) into a 4x4 transformation matrix
+    # Extrinsic matrix from previous frame (camera) to current frame (camera)
+    RT_prevframe_currframe = np.eye(4)
+    RT_prevframe_currframe = np.hstack([R, T])
+    RT_prevframe_currframe = np.vstack([RT_prevframe_currframe, np.array([0, 0, 0, 1])])
 
-    p_corr = p_est + delta_p
-    v_corr = v_est + delta_v
-    q_corr = Quaternion(axis_angle = delta_phi_normalized).quat_mult_left(q_est)
+    # Extrinsic matrix from current frame (camera) to world frame
+    RT_currframe_world = RT_prevframe_world @ np.linalg.inv(RT_prevframe_currframe)
 
-    # Compute corrected covariance
-    p_cov_corr = (np.eye(9) - K_k @ H_jac) @ p_cov_est
+    # Calculate current camera position from origin
+    new_position = RT_currframe_world[:3,3]
+    
+    new_trajectory = np.array([
+        new_position[2], 
+        new_position[0],
+        new_position[1]  
+    ])
 
-    return p_corr, v_corr, q_corr, p_cov_corr
+    # Append the new 3D point to the trajectory
+    trajectory.append(new_trajectory[0:3])
+    # print("Trajectory: ", trajectory)
 
-def destroy():
-    imu.destroy()
-    gnss.destroy()
-    carla.command.DestroyActor(vehicle)
+    # Convert the trajectory from a list of 3D points to a NumPy array
+    trajectory = np.array(trajectory).T
 
-timestep_initialized = False
-initialization_complete = False
-try:
-    while True:
-        world.tick()
-        frame = world.get_snapshot().frame
+    return trajectory, RT_currframe_world
 
-        # Update spectator camera
-        update_spectator(spectator)
+def plot_trajectory(ax1, ax2, ax3, ax4, fig, trajectory_gt, trajectory_est):
+    plt.cla()
+    
+    if PLOT_3D:
+        ax1.clear()
+        ax1.plot3D(trajectory_est[0, :], trajectory_est[1, :], trajectory_est[2, :], 'r', label = "Estimated")
+        ax1.scatter3D(trajectory_est[0, :], trajectory_est[1, :], trajectory_est[2, :], color = "r")
+        ax1.plot3D(trajectory_gt[0, :], trajectory_gt[1, :], trajectory_gt[2, :], 'b', label = "Ground Truth")
+        ax1.scatter3D(trajectory_gt[0, :], trajectory_gt[1, :], trajectory_gt[2, :], color = "b")
+        ax1.set_title("3D")
+        ax1.set_xlabel("X")
+        ax1.set_ylabel("Y")
+        ax1.set_zlabel("Z")
+        ax1.legend()
+    if PLOT_XY:
+        ax2.clear()
+        ax2.plot(trajectory_est[0, :], trajectory_est[1, :], 'r', label = "Estimated")
+        ax2.scatter(trajectory_est[0, :], trajectory_est[1, :], color = "r")
+        ax2.plot(trajectory_gt[0, :], trajectory_gt[1, :], 'b', label = "Ground Truth")
+        ax2.scatter(trajectory_gt[0, :], trajectory_gt[1, :], color = "b")
+        ax2.set_title("XY")
+        ax2.set_xlabel("X")
+        ax2.set_ylabel("Y")
+        ax2.legend()
+    if PLOT_XZ:
+        ax3.clear()
+        ax3.plot(trajectory_est[0, :], trajectory_est[2, :], 'r', label = "Estimated")
+        ax3.scatter(trajectory_est[0, :], trajectory_est[2, :], color = "r")
+        ax3.plot(trajectory_gt[0, :], trajectory_gt[2, :], 'b', label = "Ground Truth")
+        ax3.scatter(trajectory_gt[0, :], trajectory_gt[2, :], color = "b")
+        ax3.set_title("XZ")
+        ax3.set_xlabel("X")
+        ax3.set_ylabel("Z")
+        ax3.legend()
+    if PLOT_YZ:
+        ax4.clear()
+        ax4.plot(trajectory_est[1, :], trajectory_est[2, :], 'r', label = "Estimated")
+        ax4.scatter(trajectory_est[1, :], trajectory_est[2, :], color = "r")
+        ax4.plot(trajectory_gt[1, :], trajectory_gt[2, :], 'b', label = "Ground Truth")
+        ax4.scatter(trajectory_gt[1, :], trajectory_gt[2, :], color = "b")
+        ax4.set_title("YZ")
+        ax4.set_xlabel("Y")
+        ax4.set_ylabel("Z")
+        ax4.legend()
 
-        # Get sensor readings
-        sensors = get_sensor_readings(frame)
+    fig.canvas.draw()
+    fig_img = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
+    fig_img = fig_img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    cv2.imshow("Figure", cv2.cvtColor(fig_img, cv2.COLOR_RGB2BGR))
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        cv2.destroyAllWindows()
 
-        # EKF Initialization using GNSS
-        if not ekf_initialized:
-            if sensors['gnss'] is not None:
-                gnss_init_xyz, ekf_initialized, num_init_measurements = init_state_from_gnss(sensors['gnss'], gnss_init_xyz, num_init_measurements)
-                if num_init_measurements == NUM_MEASUREMENTS:
-                    gnss_init_xyz /= NUM_MEASUREMENTS
-                    # Initial position is the average of the first NUM_MEASUREMENTS GNSS measurements
-                    p_est = gnss_init_xyz
+def main():
+    try:
+        waypoint = world.get_map().get_waypoint(spawn_point.location)
 
-                    # r_init = vehicle.get_transform().rotation
-                    # euler_init = np.array([r_init.roll, r_init.pitch, r_init.yaw])
-                    # q_est = Quaternion(euler = euler_init).to_numpy()
-                    # v_init = vehicle.get_velocity()
-                    # v_est = np.array([v_init.x, v_init.y, v_init.z]).reshape(3,1)
+        # Transformation matrix from world coordinates to camera coordinates
+        world2camera = np.array(left_camera.get_transform().get_inverse_matrix())
 
-                    q_est = Quaternion().to_numpy()
+        # Ground truth (actual) trajectory
+        trajectory_gt = left_camera.get_location()
+        trajectory_gt = np.array([trajectory_gt.x, trajectory_gt.y, trajectory_gt.z]).reshape((3,1))
 
-                    p_cov_est[:3, :3] = np.eye(3) * POS_VAR
-                    p_cov_est[3:6, 3:6] = np.eye(3) * VELOCITY_VAR
-                    p_cov_est[6:, 6:] = np.eye(3) * ORIENTATION_VAR
-                    ekf_initialized = True
+        # Estimated trajectory from visual odometry
+        trajectory_est = np.array([0, 0, 0]).reshape((3,1))
+        R = np.diag([1, 1, 1])
+        T = trajectory_est
 
-                    print("Estimated initial position:", p_est)
-                    print("Ground truth initial position:", vehicle.get_location())
+        # RT: 4x4 transformaton matrix combining rotation (R) and translation (T)
+        RT = np.hstack([R, T])
+        RT = np.vstack([RT, np.array([0, 0, 0, 1])])
 
-                    # print("Estimated initial quaternion:", q_est)
-                    # print("Ground truth initial quaternion:", carla_rotation_to_ros_quaternion(vehicle.get_transform().rotation))
-            continue
+        # Initialize old_frame to store the previous frame for feature matching
+        old_frame = None
 
-        if sensors['imu'] is not None and not timestep_initialized:
-            imu_data = sensors['imu']	
-            last_timestamp = imu_data.timestamp
-            # print("First timestamp: ", last_timestamp)
-            timestep_initialized = True
-            continue
-        # If IMU measurement is available, predict the state
-        if sensors['imu'] is not None and timestep_initialized:
-            imu_data = sensors['imu']
-            imu_f = np.array([imu_data.accelerometer.x, imu_data.accelerometer.y, imu_data.accelerometer.z]).reshape(3,1)
-            imu_w = np.array([imu_data.gyroscope.x, imu_data.gyroscope.y, imu_data.gyroscope.z]).reshape(3,1)
-            print("IMU Gyro Data: ", imu_w)
-            
-            delta_t = imu_data.timestamp - last_timestamp
-            last_timestamp = imu_data.timestamp
+        # Initialize a matplotlib figure with four subplots
+        # ax1: 3D plot for visualizing the trajectory
+        # ax2: 2D plot for the XY-plane
+        # ax3: 2D plot for the XZ-plane
+        # ax4: 2D plot for the YZ-plane
+        if NUM_PLOTS > 0:
+            fig = plt.figure(figsize=(15,4))
+        else:
+            fig = plt.figure()
+        
+        ax1, ax2, ax3, ax4 = None, None, None, None
+        plot_counter = 1
+        if PLOT_3D:
+            ax1 = fig.add_subplot(1, NUM_PLOTS, plot_counter, projection='3d')
+            plot_counter += 1
+        if PLOT_XY:
+            ax2 = fig.add_subplot(1, NUM_PLOTS, plot_counter)
+            ax2.set_aspect('equal', adjustable='box')
+            plot_counter += 1
+        if PLOT_XZ:
+            ax3 = fig.add_subplot(1, NUM_PLOTS, plot_counter)
+            ax3.set_aspect('equal', adjustable='box')
+            plot_counter += 1
+        if PLOT_YZ:
+            ax4 = fig.add_subplot(1, NUM_PLOTS, plot_counter)
+            ax4.set_aspect('equal', adjustable='box')
 
-            p_est, v_est, q_est, p_cov_est = predict_state(imu_f, imu_w, delta_t, p_est, v_est, q_est, p_cov_est)
+        left_frame = None
+        right_frame = None
+        curr_frame = None
 
-            print("Predicted position:", p_est)
-            print("Ground truth position:", vehicle.get_location())
+        # Main loop
+        while True:
+            world.tick()
+            waypoint = np.random.choice(waypoint.next(1))
+            vehicle.set_transform(waypoint.transform)
+            # Current ground truth location
+            trajectory_gt_curr = left_camera.get_location()
+            trajectory_gt = np.hstack([trajectory_gt, 
+                                       np.array([trajectory_gt_curr.x, 
+                                                 trajectory_gt_curr.y, 
+                                                 trajectory_gt_curr.z]).reshape((3,1))])
 
-            # print("Predicted quaternion:", q_est)
-            # print("Ground truth quaternion:", carla_rotation_to_ros_quaternion(vehicle.get_transform().rotation))
+            # for _ in range(2):
+            #     s_frame = sensor_queue.get(True, 1.0)
+            #     if s_frame[1] == "left":
+            #         left_frame = s_frame[0]
+            #     elif s_frame[1] == "right":
+            #         right_frame = s_frame[0]
+            left_frame = camera_data['left'].copy()
+            right_frame = camera_data['right'].copy()
+            # If both frames are available:
+            if (left_frame is not None) and (right_frame is not None):
+                curr_frame = left_frame.copy()
+                if SHOW_LR_CAMERAS:
+                    cv2.imshow("Left Frame", left_frame)
+                    cv2.imshow("Right Frame", right_frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        cv2.destroyAllWindows() 
+                        break
+                depth = calculate_depth(left_frame, right_frame, K)
+            if old_frame is not None:
+                keypoints1, descriptors1 = extract_features(old_frame)
+                keypoints2, descriptors2 = extract_features(curr_frame)
+                matches = match_features(descriptors1, descriptors2)
+                matches = filter_matches_by_distance(matches, dist_threshold=0.6)
 
-            # Append estimated vehicle position for plotting
-            x_est_data.append(p_est[0])
-            y_est_data.append(p_est[1])
+                if VISUALIZE_MATCHES:
+                    # Match features of current frame and previous frame of Left Camera
+                    image_matches = cv2.drawMatches(old_frame, keypoints1, curr_frame, keypoints2, matches, None)
 
-            # Retrieve ground truth vehicle state
-            gt_location = vehicle.get_location()
-            x_gt_data.append(gt_location.x)
-            y_gt_data.append(gt_location.y)
+                    scale_percent = 70 # Resize to scale_percent% of original size
+                    im_width = int(image_matches.shape[1] * scale_percent / 100)
+                    im_height = int(image_matches.shape[0] * scale_percent / 100)
 
-            p_gt_line.set_data(x_gt_data, y_gt_data)
-            p_est_line.set_data(x_est_data, y_est_data)
+                    resized_image_matches = cv2.resize(image_matches, (im_width, im_height), interpolation=cv2.INTER_AREA)
+                    cv2.imshow("Matches", resized_image_matches)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        cv2.destroyAllWindows()
+                        break
 
-            ax1.relim()
-            ax1.autoscale_view()
-            plt.pause(0.01)
+                # Update trajectory
+                trajectory_est, RT = update_trajectory(trajectory_est, RT, matches, keypoints1, keypoints2, K, depth=depth)
 
-        # If GNSS measurement is available, correct the state
-        if sensors['gnss'] is not None:
-            gnss_data = sensors['gnss']
-            p_corr, v_corr, q_corr, p_cov_corr = correct_state(gnss_data, p_est, v_est, q_est, p_cov_est)
-            p_est, v_est, q_est, p_cov_est = p_corr, v_corr, q_corr, p_cov_corr
-            
-            print("Corrected position:", p_corr)
-            print("Ground truth position:", vehicle.get_location())
+                # Map the ground truth trajectory to the camera coordinate system
+                # 1. Append a row of 1s to the ground truth trajectory to make it homogeneous
+                trajectory_gt_world = np.append(trajectory_gt, np.ones((1, trajectory_gt.shape[1])), axis=0)
+                # 2. Multiply by world2camera to transform the ground truth trajectory to the camera coordinate system
+                trajectory_gt_camera = world2camera @ trajectory_gt_world
+                # 3. Rearrange the coordinates to match the camera's coordinate system
+                trajectory_gt_camera = np.array([trajectory_gt_camera[0], 
+                                                 trajectory_gt_camera[1], 
+                                                 trajectory_gt_camera[2]])
+                
+                # Plot trajectory
+                if SHOW_PLOTS:
+                    plot_trajectory(ax1, ax2, ax3, ax4, fig, trajectory_gt_camera, trajectory_est)
 
-            # print("Corrected quaternion:", q_est)
-            # print("Ground truth quaternion:", carla_rotation_to_ros_quaternion(vehicle.get_transform().rotation))
-
-            # Append estimated vehicle position for plotting
-            x_est_data.append(p_corr[0])
-            y_est_data.append(p_corr[1])
-
-            # Retrieve ground truth vehicle state
-            gt_location = vehicle.get_location()
-            x_gt_data.append(gt_location.x)
-            y_gt_data.append(gt_location.y)
-
-            p_gt_line.set_data(x_gt_data, y_gt_data)
-            p_est_line.set_data(x_est_data, y_est_data)
-
-            ax1.relim()
-            ax1.autoscale_view()
-            plt.pause(0.01)
-finally:
-    destroy()
+                # Normalize the depth map for visualization and display it
+                depth = ((depth - depth.mean()) / depth.std()) * 255
+                depth = depth.astype(np.uint8)
+                
+                # Show depth map
+                if SHOW_DEPTHS:
+                    cv2.imshow("Depth", depth)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        cv2.destroyAllWindows()
+                        break
+            # Update old_frame with the current frame for the next iteration
+            if curr_frame is not None:
+                old_frame = curr_frame.copy()
+    except Exception as e:
+        print("Error:", e)
+        traceback.print_exc()
+    finally:
+        # Destroy all actors
+        for actor in actors:
+            actor.destroy()
+                
+main()
