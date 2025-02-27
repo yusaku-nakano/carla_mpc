@@ -319,7 +319,7 @@ def update_trajectory(prev_trajectory, prev_RT, matches, keypoints1, keypoints2,
     
     new_trajectory = np.array([
         new_position[2], 
-        new_position[0],
+        -new_position[0],
         new_position[1]  
     ])
 
@@ -449,13 +449,6 @@ def main():
                                        np.array([trajectory_gt_curr.x, 
                                                  trajectory_gt_curr.y, 
                                                  trajectory_gt_curr.z]).reshape((3,1))])
-
-            # for _ in range(2):
-            #     s_frame = sensor_queue.get(True, 1.0)
-            #     if s_frame[1] == "left":
-            #         left_frame = s_frame[0]
-            #     elif s_frame[1] == "right":
-            #         right_frame = s_frame[0]
             left_frame = camera_data['left'].copy()
             right_frame = camera_data['right'].copy()
             # If both frames are available:
@@ -498,7 +491,7 @@ def main():
                 trajectory_gt_camera = world2camera @ trajectory_gt_world
                 # 3. Rearrange the coordinates to match the camera's coordinate system
                 trajectory_gt_camera = np.array([trajectory_gt_camera[0], 
-                                                 trajectory_gt_camera[1], 
+                                                 -trajectory_gt_camera[1], 
                                                  trajectory_gt_camera[2]])
                 
                 # Plot trajectory
