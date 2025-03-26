@@ -7,7 +7,7 @@ server:
 planner:
   model: MPCPlanner
   alias: MPC
-  N: 60 #79 # prediction horizon
+  N: 40 #79 # prediction horizon
   dt: 0.1 # sampling time
 
   ca_radius: 2.2 # collision avoidance radius

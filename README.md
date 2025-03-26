@@ -1,289 +1,327 @@
-# Visual Odometry
+# MPC CARLA
 
-**Motivation**
+## **Overview**
 
-When I was building my Kalman Filter, I got a pretty good grasp of how IMUs and GNSS, two prominent sensors used in autonomous cars, can help capture a vehicle's trajectory.
+This is an autonomous vehicle control system using Model Predictive Control (MPC) in CARLA. 
 
-In this project, I wanted to challenge myself by using cameras, one of the most powerful sensors, to estimate a vehicle's trajectory via visual odometry.
+The system:
 
-​
+1. Plans optimal trajectories considering vehicle dynamics and obstacles
+2. Controls the vehicle to follow these trajectories
+3. Uses a Frenet frame formulation for path following
 
-1. First, the disparity between the left and right image frames was calculated using StereoSGBM (users can manually switch to StereoBM).
-2. Then, that disparity was used to create a depth map.
-3. Feature extraction was performed using the ORB (Oriented FAST and Rotated BRIEF) feature extractor and descriptor.
-4. Then, features between the current frame and previous frame were matched using the Brute Force Matcher.
-5. By movement of those features were used to estimate the motion between the two relative frames. The rotation and translation between the current and previous frames were computed using the PnP and RANSAC algorithms.
-6. Through recursion, the trajectory of the vehicle in the global frame was updated.
+### **Main Components Flow**
 
-**Working Video**
+![IMG_BD3BEFBE74D0-1.jpeg](IMG_BD3BEFBE74D0-1.jpeg)
 
-[https://drive.google.com/file/d/1ztxZ5P-hhEPkfXok3fLLxexhDg4tke9r/view?usp=drive_link](https://drive.google.com/file/d/1ztxZ5P-hhEPkfXok3fLLxexhDg4tke9r/view?usp=drive_link)
+1. **Initialization**: sets up CARLA connection, spawns ego vehicle, initializes world model, initializes the agent
+2. **Perception**: update the states of the ego vehicle and all actors
+3. **Prediction**: predict the movements of all obstacles/actors
+4. **Planning**: plan a trajectory by solving an optimization problem subject to vehicle dynamics (bicycle model in Frenet frame), state/input constraints, and collision avoidance constraints
+5. **Control**: apply control inputs to follow the planned trajectory
+6. **Logging/Visualization**: log the actor positions, velocities, etc. as well as predictions of agents at each point, etc. Additionally, visualize the planned trajectory.
 
-**Visual Odometry Basics**
+## **Perception**
 
-![IMG_3184FD26822D-1.jpeg](IMG_3184FD26822D-1.jpeg)
+### **Update with Ground Truth (Temporary)**
 
-- We have four basic coordinates we care about:
-    1. The **world coordinates**, which is an inertial frame that represents everything in the map (including the car, camera, object in question) in terms of global coordinates.
-        - The object in question in the world frame would be represented in terms of $x^w,y^w,z^w$:
-            
-            $$
-            [O]^W=
-            \begin{bmatrix}
-            x^w\\
-            y^w\\
-            z^w
-            \end{bmatrix}
-            $$
-            
-    2. The **camera coordinates**, which is centered on the position of the camera 
-        
-        $$
-        \begin{aligned}
-        [O]^C&=[T]^{CW}[O]^W\\
-        &=[R|t]^{CW}[O]^W
-        \end{aligned}
-        $$
-        
-        - $T$ is the **extrinsic matrix** that converts world coordinates to camera coordinates
-            - AKA, what rotation and translation do I need to convert from the world coordinates to the camera coordinates?
-    3. The **image coordinates**, which represents the projection of 3D points in camera coordinates onto the 2D image plane 
-        
-        $$
-        [O]^I=K[O]^C
-        $$
-        
-        - $K$ is the **intrinsic matrix**, which projects the 3D points in the camera coordinate system onto the 2D image plane.
-    4. The **pixel coordinates**, which is a **discrete** coordinate system used to identify the location of pixels in the digital image.
+- Since the primary focus of this project is the planning + control steps, for now, we will update the states of the ego and actors with ground truth.
 
-**Homogeneous Coordinates**
+## **Prediction**
 
-- In homogeneous coordinates…
-    - A 2D point $\begin{bmatrix}
-    u\\v
-    \end{bmatrix}$can be represented as $\begin{bmatrix}
-    u\\v\\1
-    \end{bmatrix}$
-    - A 3D point $\begin{bmatrix}
-    x\\y\\z
-    \end{bmatrix}$can be represented as $\begin{bmatrix}
-    x\\y\\z\\1
-    \end{bmatrix}$
-- The idea is that scaling a homogeneous coordinate by a non-zero scalar does NOT change the physical point they represent. Thus:
+### **Constant Velocity Model**
+
+**Continuous-Time Dynamics**
+
+- For an obstacle with state $X=[x,y,v_x,v_y]^T$…
+    
+    $$
+    \begin{aligned}
+    \dot x&=v_x\\
+    \dot y&=v_y\\
+    \dot v_x&=0\\
+    \dot v_y&=0
+    \end{aligned}
+    $$
+    
+    - Since we’re assuming constant velocity, the acceleration $\dot v_x,\dot v_y$ is zero
+
+**Discrete-Time Dynamics**
+
+- For a prediction horizon $N$ with timestep $\Delta t$, the predicted states are:
+    
+    $$
+    \begin{aligned}
+    x_{k+1}&=x_k+v_{x,k}\Delta t\\
+    y_{k+1}&=y_k+v_{y,k}\Delta t\\
+    v_{x,k+1}&=v_{x,k}\\
+    v_{y,k+1}&=v_{y,k}
+    \end{aligned}
+    $$
+    
+- In matrix form, this can be written as:
     
     $$
     \begin{bmatrix}
-    u\\v\\1
-    \end{bmatrix}
-    =
+    x_{k+1}\\
+    y_{k+1}\\
+    v_{x,k+1}\\
+    v_{y,k+1}
+    \end{bmatrix}=
     \begin{bmatrix}
-    ku\\kv\\k
+    1 & 0 & \Delta t & 0\\
+    0 & 1 & 0 & \Delta t\\
+    0 & 0 & 1 & 0\\
+    0 & 0 & 0 & 1
     \end{bmatrix}
-    \qquad\forall k\ne0
-    $$
-    
-
-**Computing the Intrinsic Matrix**
-
-- Let the object in the camera coordinates be represented as:
-    
-    $$
-    [O]^C=\begin{bmatrix}
-    x_O^C\\y_O^C\\z_O^C
+    \begin{bmatrix}
+    x_{k}\\
+    y_{k}\\
+    v_{x,k}\\
+    v_{y,k}
     \end{bmatrix}
     $$
     
-- Through similar triangles:
-    
-    ![IMG_95A60F0AD0EC-1.jpeg](IMG_95A60F0AD0EC-1.jpeg)
-    
-    - Thus, the object $O$ in image coordinates is:
+
+## **Planning**
+
+### **Vehicle Dynamics**
+
+**Global Dynamics (Continuous)**
+
+$$
+\begin{aligned}
+\dot x(t)&=v(t)\cos(\psi(t)+\beta(t))\\
+\dot y(t)&=v(t)\sin(\psi(t)+\beta(t))\\
+\dot\psi(t)&=\frac{1}{l_r}v(t)\sin(\beta(t))\\
+\dot v(t)&=a(t)\\
+\beta(t)&=\tan^{-1}\left(\frac{l_r}{l_f+l_r}\tan(\delta_f(t))\right)
+\end{aligned}
+$$
+
+**Frenet Frame Dynamics (Continuous)**
+
+$$
+\begin{aligned}
+\dot s(t)&=\frac{v(t)\cos(\beta(t)+e_\psi(t))}{1-\kappa(s(t))e_y(t)}\\
+\dot e_y(t)&=v(t)\sin(\beta(t)+e_\psi(t))\\
+\dot e_\psi(t)&=\frac{v(t)\sin(\beta(t))}{l_r}-\dot s(t)\kappa(s(t))\\
+\dot v(t)&=a(t)\\
+\beta(t)&=\tan^{-1}\left(\frac{l_r}{l_f+l_r}\tan(\delta_f(t))\right)
+\end{aligned}
+$$
+
+**Relationship between Global and Frenet Coordinates**
+
+$$
+\begin{aligned}
+e_y&=
+(y(t)-y_{ref})\cos(\psi_{ref})-
+(x(t)-x_{ref})\sin(\psi_{ref})\\
+e_\psi&=
+\psi(t)-\psi_{ref}\\
+s&=s_{ref}+
+(x(t)-x_{ref})\cos(\psi_{ref})+
+(y(t)-y_{ref})\sin(\psi_{ref})
+
+\end{aligned}
+$$
+
+**Discretized Dynamics (Euler’s Method)**
+
+$$
+\red{
+\begin{aligned}
+s_{k+1}&=s_k+\Delta t\cdot \frac{v_k\cos(\beta_k+e_{\psi,k})}{1-\kappa(s_k)e_{y,k}}\\
+e_{y,k+1}&=e_{y,k}+\Delta t\cdot v_k\sin(\beta_k+e_{\psi,k})\\
+e_{\psi,k+1}&=e_{\psi,k}+\Delta t\cdot\left(\frac{v_k\sin(\beta_k)}{l_r}-\dot s_k\kappa(s_k)\right)\\
+v_{k+1}&=v_k+\Delta t\cdot a_k\\
+\beta_{k+1}&=\tan^{-1}\left(\frac{l_r}{l_f+l_r}\tan(\delta_{f,k})\right)
+\end{aligned}
+}
+$$
+
+**Discretized Dynamics (RK4 Method)**
+
+- Consider state vector $X$ and dynamics $\dot X=f(X,u)$:
+    - For our bicycle model:
         
         $$
         \begin{aligned}
-        [O]^I=\begin{bmatrix}
-        f\frac{x_O^C}{z_O^C}\\
-        f\frac{y_O^C}{z_O^C}\\1
-        \end{bmatrix}
+        f_s(X,u)&=\frac{v(t)\cos(\beta(t)+e_\psi(t))}{1-\kappa(s(t))e_y(t)}\\
+        f_{e_y}(X,u)&=v(t)\sin(\beta(t)+e_\psi(t))\\
+        f_{e_\psi}(X,u)&=\frac{v(t)\sin(\beta(t))}{l_r}-\dot s(t)\kappa(s(t))\\
+        f_v(X,u)&=a(t)\\
+        \beta(t)&=\tan^{-1}\left(\frac{l_r}{l_f+l_r}\tan(\delta_f(t))\right)
         \end{aligned}
         $$
         
-- Define $W,H$ as the width and height of the image
-- If the **pixel coordinates** and **image coordinates** have the same orientation:
-    
-    ![IMG_9C119B0673C0-1.jpeg](IMG_9C119B0673C0-1.jpeg)
-    
-    - Thus, the object $O$ in **pixel coordinates** is:
+    - Then, for each state:
         
         $$
         \begin{aligned}
-        [O]^P&=
-        \begin{bmatrix}
-        fx_O^C+\frac{W}2z_O^C\\
-        fy_O^C+\frac{H}2z_O^C\\
-        z_O^C
-        \end{bmatrix}
-        \\
-        &=
-        \underbrace{
-        \begin{bmatrix}
-        f & 0 & \frac{W}2\\
-        0 & f & \frac{H}2\\
-        0 & 0 & 1
-        \end{bmatrix}
-        }_K
-        \underbrace{
-        \begin{bmatrix}
-        x_O^C\\
-        y_O^C\\
-        z_O^C
-        \end{bmatrix}
-        }_{[O]^C}
+        k_{1,s}&=f_s(X_k,u_k)\\
+        k_{1,e_y}&=f_{e_y}(X_k,u_k)\\
+        k_{1,e_\psi}&=f_{e_\psi}(X_k,u_k)\\
+        k_{1,v}&=f_{e_v}(X_k,u_k)\\
         \end{aligned}
         $$
-        
-- However, if the pixel coordinates are arranged like this:
-    
-    ![IMG_DDE084E534FB-1.jpeg](IMG_DDE084E534FB-1.jpeg)
-    
-    - The **intrinsic matrix** would be a little different:
         
         $$
         \begin{aligned}
-        [O]^P&=
-        \begin{bmatrix}
-        fx_O^C+\frac{W}2z_O^C\\
-        \red-fy_O^C+\frac{H}2z_O^C\\
-        z_O^C
-        \end{bmatrix}
-        \\
-        &=
-        \underbrace{
-        \begin{bmatrix}
-        f & 0 & \frac{W}2\\
-        0 & \red-f & \frac{H}2\\
-        0 & 0 & 1
-        \end{bmatrix}
-        }_K
-        \underbrace{
-        \begin{bmatrix}
-        x_O^C\\
-        y_O^C\\
-        z_O^C
-        \end{bmatrix}
-        }_{[O]^C}
+        k_{2,s}&=f_s\left(X_k
+        +\frac{\Delta t}{2}[k_{1,s},k_{1,e_y},k_{1,e_\psi},k_{1,v}]^T
+        ,u_k\right)\\
+        k_{2,e_y}&=f_{e_y}\left(X_k
+        +\frac{\Delta t}{2}[k_{1,s},k_{1,e_y},k_{1,e_\psi},k_{1,v}]^T
+        ,u_k\right)\\
+        k_{2,e_\psi}&=f_{e_\psi}\left(X_k
+        +\frac{\Delta t}{2}[k_{1,s},k_{1,e_y},k_{1,e_\psi},k_{1,v}]^T
+        ,u_k\right)\\
+        k_{2,v}&=f_{e_v}\left(X_k
+        +\frac{\Delta t}{2}[k_{1,s},k_{1,e_y},k_{1,e_\psi},k_{1,v}]^T
+        ,u_k\right)\\
         \end{aligned}
         $$
         
+        Similarly for $k_3$ and $k_4$
+        
+    - Finally:
+        
+        $$
+        \red{
+        \begin{aligned}
+        s_{k+1}&=s_k+\frac{\Delta t}6(k_{1,s}+2k_{2,s}+2k_{3,s}+k_{4,s})\\
+        e_{y,k+1}&=e_{y,k}+\frac{\Delta t}6(k_{1,e_y}+2k_{2,e_y}+2k_{3,e_y}+k_{4,e_y})\\
+        e_{\psi,k+1}&=e_{\psi,k}+\frac{\Delta t}6(k_{1,e_\psi}+2k_{2,e_\psi}+2k_{3,e_\psi}+k_{4,e_\psi})\\
+        v_{k+1}&=v_k+\frac{\Delta t}6(k_{1,v}+2k_{2,v}+2k_{3,v}+k_{4,v})\\
+        \end{aligned}
+        }
+        $$
+        
 
-**Calculating the focal length $f$ from FOV**: 
-
-![IMG_B9C9742F81BD-1.jpeg](IMG_B9C9742F81BD-1.jpeg)
-
-$$
-f=\frac{W}{2\tan(\text{FOV}_{deg}\cdot\frac\pi{360})}
-$$
-
-**Calculating Disparity and Depth**
-
-![Screenshot 2025-01-08 at 15.50.41.jpg](Screenshot_2025-01-08_at_15.50.41.jpg)
-
-- Define the **disparity** $d$ as the difference between the image coordinates of the same pixel in the left and right images in the **image coordinates**:
-    
-    $$
-    d=[x]_L^I-[x]_R^I
-    $$
-    
-- If there was only one feature to calculate the disparity for, this would be easy, but an image would have hundreds of features that may all differ a bit in disparity. Thus, OpenCV has algorithms like **Semi-Global Block Matching (SGBM)** that uses en optimization process to find the most probable disparity value.
-
-![IMG_463D0130B1D9-1.jpeg](IMG_463D0130B1D9-1.jpeg)
+### **Optimization Problem**
 
 $$
-z=\frac{fb}d
+\begin{aligned}
+\min_{x_{0:N},u_{0:N-1}}&
+\sum_{k=0}^{N-1}
+Q_{e_y}e_{y,k}^2+
+Q_{e_\psi}e_{\psi,k}^2+
+Q_v(v_k-v_{des})^2+
+R_aa_k^2+
+R_{\delta_f}\delta_{f,k}^2\\
+\text{s.t. }&
+\text{vehicle dynamics}\\
+&
+\text{initial constraints}\\
+&|e_{y,k}|\le e_{y,max}\\
+&v_{min}\le v_k\le v_{max}\\
+&|\delta_{f,k}|\le\delta_{f,max}\\
+&a_{min}\le a_k\le a_{max}\\
+&|\dot\delta_{f,k}|\le\dot\delta_{f,max}\\
+&|\dot a_k|\le j_{max}\\
+& 2r_{ca}=d_{min}\le \sqrt{
+(x_k-x_{obs,k}^i)^2+(y_k-y_{obs,k}^i)^2
+}\qquad
+\forall k\in[0,N],\,
+\forall i\in[1,n_{obs}]
+\end{aligned}
 $$
 
-**Motion Estimation**
+where:
 
-- The **motion estimation** problem formulation is usually as follows:
-- **Objective**: obtain $\begin{bmatrix}
-x\\y\\z\\1
-\end{bmatrix}^W_{i+1}$, the coordinates of the camera at frame $i+1$ in the global frame
-- **Known**:
-    - $\begin{bmatrix}
-    x\\y\\z\\1
-    \end{bmatrix}^W_{i}$: coordinates of camera at frame $i$ in the global frame
-    - $[R|t]^{C_iW}$: transformation matrix from global frame → camera frame at frame $i$
-        - Obtained through past recursion + initialization
-    - $[R|t]^{C_{i+1}C_i}$: transformation matrix from camera frame at $i$ → camera frame at $i+1$
-        - Obtained through PnP algorithm + RANSAC
-
-![IMG_D2807E69AB37-1.jpeg](IMG_D2807E69AB37-1.jpeg)
-
-- Then, the equation becomes, recursively:
+- Cost weights:
+    - $Q_{e_y},Q_{e_\psi},Q_v$: state cost weights
+    - $R_a,R_{\delta_f}$: input cost weights
+- $e_y$ constraints:
     
     $$
-    \begin{bmatrix}
-    x\\y\\z\\1
-    \end{bmatrix}^W_{i+1}=([R|t]^{C_iW})^{-1}
-    ([R|t]^{C_{i+1}C_i})^{-1}
-    \begin{bmatrix}
-    x\\y\\z\\1
-    \end{bmatrix}^W_{i}
+    |e_{y,k}|\le e_{y,max}
+    $$
+    
+- State constraints:
+    
+    $$
+    v_{min}\le v_k\le v_{max}
+    $$
+    
+- Input constraints:
+    
+    $$
+    \begin{aligned}
+    |\delta_{f,k}|&\le\delta_{f,max}\\
+    a_{min}&\le a_k\le a_{max}
+    \end{aligned}
+    $$
+    
+- Input rate constraints:
+    
+    $$
+    \begin{aligned}
+    |\dot\delta_{f,k}|&\le\dot\delta_{f,max}\\
+    |\dot a_k|&\le j_{max}
+    \end{aligned}
+    $$
+    
+    - $j_{max}$: jerk limit
+- Obstacle avoidance constraints:
+    
+    $$
+    2r_{ca}=d_{min}\le \sqrt{
+    (x_k-x_{obs,k}^i)^2+(y_k-y_{obs,k}^i)^2}
+    \qquad
+    \forall k\in[0,N],\,
+    \forall i\in[1,n_{obs}]
+    $$
+    
+    - $r_{ca}$: collision avoidance radius
+    - $d_{min}$: minimum safe distance (twice the collision avoidance radius)
+    - $n_{obs}$: number of obstacles
+
+## **Control**
+
+### **Ackermann**
+
+- For a vehicle with Ackermann steering geometry:
+    
+    $$
+    \text{steering}=\tan^{-1}\left(\frac{L}R\right)
+    $$
+    
+    where: 
+    
+    - $L$: wheelbase (distance between front and rear axles)
+    - $R$: turning radius
+- The control inputs are:
+    
+    $$
+    \begin{aligned}
+    \text{throttle}&=
+    \begin{cases}
+    \frac{a}{a_{max}}& \text{if }a\ge0\\
+    0 &\text{if }a<0
+    \end{cases}\\
+    
+    \text{brake}&=
+    \begin{cases}
+    0 & \text{if }a\ge0\\
+    \frac{-a}{a_{min}} &\text{if }a<0
+    \end{cases}\\
+    
+    \text{steer}&=\frac{\delta_f}{\delta_{f,max}}
+    \end{aligned}
     $$
     
 
-**Computer Vision**
+### **Perfect**
 
-**Feature Extractor**
-
-- In this project, we utilize the ORB feature extractor and descriptor.
-- We define a feature point by its coordinates $u$ and $v$ in the image frame
-- We describe a **descriptor** $f$ as an $n$-dimensional vector associated with each feature
-
-![Screenshot 2025-01-08 at 20.26.47.jpg](Screenshot_2025-01-08_at_20.26.47.jpg)
-
-- As with feature detectors, descriptors should be **repeatable**, which means that regardless of shifts in position, scale, and illumination, the same point of interest in two images should have approximately the same descriptor
+- Perfect control directly applies the planned trajectory without considering vehicle dynamics:
     
-    ![Screenshot 2025-01-08 at 20.28.04.jpg](Screenshot_2025-01-08_at_20.28.04.jpg)
-    
-- The feature descriptors should be **distinctive**, meaning it should allow us to distinguish between two close-by features
-    
-    ![Screenshot 2025-01-08 at 20.29.20.jpg](Screenshot_2025-01-08_at_20.29.20.jpg)
-    
-- The feature descriptors should also be **compact** and **efficient to compute**
-
-**Feature Matching**
-
-- In this project, we utilize a **brute force feature matcher** to match features between two frames:
-- The **Brute Force Feature Matching** algorithm is as follows:
-    1. Define a distance function $d(f_i,f_j)$ that compares two descriptors
-    2. Define distance ratio threshold $\rho$
-    3. For every feature $f_i$ in image 1:
-        1. Compute $d(f_i,f_j)$ with all features $f_j$ in image 2
-        2. Find the closest match $f_c$ and second closest match $f_s$
-        3. Compute the distance ratio $\frac{d(f_i,f_c)}{d(f_i,f_s)}$
-        4. Keep this match only if $\frac{d(f_i,f_c)}{d(f_i,f_s)}<\rho$
-
-**Outlier Rejection**
-
-- **RANSAC Algorithm**:
-    1. Given a model for identifying a problem solution from a set of data points, find the smallest number $M$ of data points or samples needed to compute the parameters of this model (e.g. $t_u$ and $t_v$ offsets of least square solution)
-    2. Randomly select $M$ samples from data
-    3. Compute model parameters using only the selected $M$ samples
-    4. Use the computed parameters and count how many of the remaining data points agreed with this computed solution
-        - Accepted points: **inliers**
-    5. If the number of inliers $C$ is satisfactory, or if the algorithm has iterated a pre-set maximum number of iterations, terminate and return the computed solution and inlier set
-        - Else, go back to step 2
-    6. Recompute model parameters from entire best inlier set
-
-**Perspective N Point (PNP) for Extrinsic Matrix Estimation**
-
-- **Perspective N Point Algorithm**:
-    - Given: feature locations in 3D, corresponding projection in 2D, and camera intrinsic calibration matrix $K$
-    1. Use **Direct Linear Transform (DLT)** to solve for an initial guess for $R$ and $t$
-        - This requires a linear model but we have nonlinear equations in $R$ and $t$
-    2. Refine the initial DLT solution with an iterative nonlinear optimization technique called the **Levenberg-Marquardt Algorithm (LM)**
-        - PNP requires at least 3 features to solve $R$ and $t$ (4 if we don’t want ambiguous solutions)
-    3. Use RANSAC to handle outliers
-- `cv2.solvePnP()`: solves for camera position given 3D points in frame $k-1$, their projection in frame $k$, and the camera intrinsic calibration matrix
-- `cv2.solvePnPRansac()`: same as above but uses RANSAC to handle outliers
+    $$
+    \begin{aligned}
+    \text{position}&=[x_p(t),y_p(t)]\\
+    \text{velocity}&=[v_x(t),v_y(t)]\\
+    \text{heading}&=\psi_p(t)
+    \end{aligned}
+    $$

@@ -7,7 +7,7 @@ from typing import List
 
 from kinematic_bicycle_model_frenet import KinematicBicycleModelFrenet
 from utils import VehicleAction, VehicleReference, ReferenceTrajectory, PlannedTrajectory
-from MPCSolver_old import MPCSolver
+from MPCSolver import MPCSolver
 
 class BasePlanner:
     def __init__(self, planner_config: dict):
