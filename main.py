@@ -1,522 +1,662 @@
 import carla
 import random
-import math
+from random import choices
 import numpy as np
-from queue import Queue
 import cv2
+import sys
+import os
+import copy
+import pickle
+import decouple
+import subprocess
+import pdb
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import time
-import xml.etree.ElementTree as ET
-import traceback
+import argparse
 
-# Camera Settings
-BASELINE = 0.4
-FOV = 90
-IMAGE_HEIGHT = 720
-IMAGE_WIDTH = 1280
+sys.path.append(r'C:\Users\yusak\Downloads\CARLA_0.9.14\WindowsNoEditor\PythonAPI')
+sys.path.append(r'C:\Users\yusak\Downloads\CARLA_0.9.14\WindowsNoEditor\PythonAPI\carla')
 
-# Stereo Matching Algorithms
-# Choose either between "BM" or "SGBM"
-STEREO_MATCHER = "SGBM"
+from agents.navigation.global_route_planner import GlobalRoutePlanner
 
-# Depth Map Settings
-NDISP_FACTOR = 6 # Adjust this; disparity search range for computing depth map
-MIN_DISPARITY = 0
-NUM_DISPARITIES = 16*NDISP_FACTOR - MIN_DISPARITY
-BLOCKSIZE = 11
-WINDOWSIZE = 6
+# from MPCAgent import MPCAgent
+from MPCAgent import MPCAgent
+from world_model import WorldModel
+from utils import load_config, connect, set_synchronous_mode, update_fps
+from server import spawn_vehicle
+from route import generate_route
+from log import SimulationLog
+from visualization import keep_latest_image, setup_birds_eye_camera, draw_world, draw_points, draw_waypoints
 
-# Motion Estimation Settings
-# For each pixel with a depth LESS than S_LIMIT, we will compute the coordinate of that point in
-# the camera coordinate system, and use those points to estimate the motion.
-S_LIMIT = 100
+CARLA_PATH = os.path.join(decouple.config("CARLA_DIR"), "PythonAPI/carla")
+PROJECT_DIR = decouple.config("PROJECT_DIR")
 
-# Display settings
-SHOW_PLOTS = True
-SHOW_LR_CAMERAS = True
-SHOW_DEPTHS = True
-VISUALIZE_MATCHES = True
 
-# Plot Settings
-PLOT_3D = True
-PLOT_XY = True
-PLOT_XZ = True
-PLOT_YZ = True
-NUM_PLOTS = sum([PLOT_3D, PLOT_XY, PLOT_XZ, PLOT_YZ])
+class Simulation:
 
-# Initialize world
-client = carla.Client('localhost', 2000)
-client.set_timeout(10.0)
-world = client.get_world()
+    def __init__(self, args):
+        self.args = args
+        self.config = load_config()
 
-#Spectator Camera
-spectator = world.get_spectator()
+        # Connect to CARLA server
+        self.client, self.world = connect(self.config['server'])
 
-def update_spectator(spectator):
-    transform = vehicle.get_transform()
-    spectator.set_transform(
-        carla.Transform(transform.location + carla.Location(z=50), carla.Rotation(pitch=-90))
-    )
+        # If anything's remaining from previous run, destroy it
+        self.destroy_all_vehicles() 
 
-# Initialize ego vehicle and sensors
-spawn_point = random.choice(world.get_map().get_spawn_points())
-bp = world.get_blueprint_library()
-vehicle_bp = bp.filter('model3')[0]
+        # Loads map (Town05_Opt)
+        self.check_and_load_map()
 
-# Spawn vehicle and sensors
-vehicle = world.spawn_actor(vehicle_bp, spawn_point)
-# vehicle.set_autopilot(True)
+        # Addressing delay before car starts accelerating
+        # github.com/carla-simulator/carla/issues/6477
+        settings = self.world.get_settings()
+        settings.substepping = True
+        settings.max_substep_delta_time = 0.001
+        settings.max_substeps = 100
+        settings.fixed_delta_seconds = 1.0/self.config['server']['fps']
+        self.world.apply_settings(settings)
 
-# Append vehicle to list of actors
-actors = []
-actors.append(vehicle)
+        # Initialize world model
+        self.world_model = WorldModel(self.world)
 
-# Add left and right cameras
-camera_bp = bp.find('sensor.camera.rgb')
+        # Initialize spectator
+        self.spectator = self.world.get_spectator()
 
-camera_bp.set_attribute("image_size_x", str(IMAGE_WIDTH))
-camera_bp.set_attribute("image_size_y", str(IMAGE_HEIGHT))
-camera_bp.set_attribute("fov", str(FOV))
+        # Set synchronous mode
+        # When synchronous mode is enabled, the simulation is paused until the next tick
+        # Makes sure simulation is synced with other processes (e.g. collecting sensor data, performing computations, etc.)
+        self.settings = set_synchronous_mode(self.world, self.config['server'], return_settings=True)
 
-# camera_bp.set_attribute('fov', str(FOV))
-left_camera_transform = carla.Transform(carla.Location(x=2, y=-BASELINE/2, z=1.4))
-right_camera_transform = carla.Transform(carla.Location(x=2, y=BASELINE/2, z=1.4))
-left_camera = world.spawn_actor(camera_bp, left_camera_transform, attach_to=vehicle)
-right_camera = world.spawn_actor(camera_bp, right_camera_transform, attach_to=vehicle)
+        # For FPS Calculation and logging
+        self.frame_count = 0 # frame count for fps calculation
+        self.current_frame = 0 # current simulation frame
+        self.start_time = time.time() # for fps calculation; updates every iteration
+        self.simulation_start_time = time.time() # does NOT update every iteration
+        self.fps = 0
+        self.last_ego_position = None # keep track whether ego is stuck
+        self.stuck_counter = 0
+        self.wait_counter = 0
 
-# Append cameras to list of actors
-actors.append(left_camera)
-actors.append(right_camera)
+        # SimulationLog stores how simulation developed (e.g. actor positions, velocities, etc.)
+        self.simulation_log = SimulationLog()
 
-# Build the K Projection Matrix
-# K = [[Fx 0 image_width/2],
-#      [0 Fy image_height/2],
-#      [0 0 1]]
-# Fx and Fy are the same because the pixel aspect ratio is 1
+        # Whether to make predictions for the ego vehicle
+        self.world_model.set_ego_predictions(self.config["prediction"]["predict_ego"])
 
-image_width = camera_bp.get_attribute("image_size_x").as_int()
-image_height = camera_bp.get_attribute("image_size_y").as_int()
-fov = camera_bp.get_attribute("fov").as_float()
-focal = image_width / (2.0 * np.tan(fov * np.pi / 360.0))
+        # Initialize route planner
+        self.global_route_planner = GlobalRoutePlanner(self.world_model.map_gt, sampling_resolution=self.config["planner"]["dt"]*1) # 1 m/s (low velocity for fine samples of waypoints)
 
-K = np.array([[focal, 0,     image_width / 2.0],
-              [0,     -focal, image_height / 2.0],
-              [0,     0,     1]])
+        # Setup spawn point, route, run name
+        self.setup_run()
 
-# sensor_queue = Queue()
-# def process_image(sensor_data, sensor_name, sensor_queue):
-#     frame = np.array(sensor_data.raw_data, dtype=np.uint8)
-#     frame = np.reshape(frame, (sensor_data.height, sensor_data.width, 4))[...,:3]
-#     sensor_queue.put((frame, sensor_name))
+        self.counter = 0 # Frame counter that is never reset
 
-camera_data = {'left': np.zeros((image_height, image_width, 3), dtype=np.uint8),
-               'right': np.zeros((image_height, image_width, 3), dtype=np.uint8)}
+        # Create logging directory if not exist
+        self.check_logging_dir()
 
-def l_camera_callback(image, data_dict):
-    array = np.frombuffer(image.raw_data, dtype=np.uint8)
-    array = np.reshape(array, (image.height, image.width, 4))
-    data_dict['left'] = array[..., :3]  # Keep only RGB channels
+        # ???
+        self.setup_recorder()
 
-def r_camera_callback(image, data_dict):
-    array = np.frombuffer(image.raw_data, dtype=np.uint8)
-    array = np.reshape(array, (image.height, image.width, 4))
-    data_dict['right'] = array[..., :3]  # Keep only RGB channels
+        # Set the agent destination
+        self.setup_navigation()
 
-left_camera.listen(lambda image: l_camera_callback(image, camera_data))
-right_camera.listen(lambda image: r_camera_callback(image, camera_data))
+        # Spawns vehicle with blueprint as tesla model 3, set ego for world model,
+        # Setup MPC Agent, and collision detector
+        self.spawn_vehicle_and_agent()
 
-def compute_disparity(img_left, img_right):
-    """
-    Compute disparity between left and right images
+        # Setup birds eye camera
+        self.setup_birds_eye_camera(self.config['visualization']['birds_eye_camera'])
 
-    numDisparities: number of disparities to search
-        since numDisparities is set to 96, the maximum possible disparity is 96
-    blockSize: size of the block used for matching.
-        A larger block size can smooth out noise but may lose fine details
-    P1 and P2: parameters used in the disparity transform
-        P1: penalty for small disparity changes
-        P2: penalty for large disparity changes
-    mode: mode of the disparity transform
-    """
-    img_left_grayscale = cv2.cvtColor(img_left, cv2.COLOR_BGR2GRAY)
-    img_right_grayscale = cv2.cvtColor(img_right, cv2.COLOR_BGR2GRAY)
+        # store carla actor id of ego vehicle and other useful properties like global plan
+        self.log_ego_attrs() 
 
-    if STEREO_MATCHER == "BM":
-        stereo = cv2.StereoBM.create(numDisparities=16*NDISP_FACTOR, blockSize=15)
-    elif STEREO_MATCHER == "SGBM":
-        stereo = cv2.StereoSGBM_create(minDisparity = MIN_DISPARITY,
-                                       numDisparities = NUM_DISPARITIES,
-                                       blockSize = BLOCKSIZE,
-                                       P1 = 8*3*WINDOWSIZE**2,
-                                       P2 = 32*3*WINDOWSIZE**2,
-                                       disp12MaxDiff = 1,
-                                       uniquenessRatio = 15,
-                                       speckleWindowSize = 0,
-                                       speckleRange = 2,
-                                       preFilterCap = 63,
-                                       mode = cv2.STEREO_SGBM_MODE_SGBM_3WAY)
-    disparity = stereo.compute(img_left_grayscale, img_right_grayscale).astype(np.float32)/16
-    # .compute method caculates the disparity map for the left image using the SGBM matcher
-    # The result is divided by 16 to convert it from fixed-point (used by CV2) to floating point
+        # set config of SimulationLog (???)
+        self.log_config()
 
-    return disparity
+        if self.config["visualization"]["debug"]["live_ego_plots"]:
+            self._setup_ego_live_plots()
+        
+    def _setup_ego_live_plots(self):  
+        self.time_data = []
+        self.vel_data = []
+        self.p_vel_data = []
+        self.h_data = []
+        self.p_h_data = []
+        self.acc_data = []
+        self.p_acc_data = []
+        self.throttle_data = []
+        self.brake_data = []
+        self.opt_flag_data = []
 
-def calculate_depth(img_left, img_right, K):
-    """
-    Computes a depth map from the disparity
+        plt.ion()
+        self.fig, (self.ax1, self.ax2, self.ax3, self.ax4) = plt.subplots(4, 1, figsize=(10, 8))
 
-    focal: focal length of the camera
-    baseline: distance between the left and right cameras
+        # Configure velocity plot
+        self.ax1.set_title("Ego Vehicle Velocity")
+        self.ax1.set_ylabel("Velocity magnitude (m/s)")
+        self.vel_line, = self.ax1.plot([], [], label="Velocity", color="r")
+        self.p_vel_line, = self.ax1.plot([], [], label="Planned Velocity", color="g")
+        self.vlimu_line, = self.ax1.plot([], [], label="Velocity Limit (max)", color="y")
+        self.vliml_line, = self.ax1.plot([], [], label="Velocity Limit (min., neg)", color="y")
+        self.ax1.legend()
 
-    Depth formula: depth = focal_length * baseline / disparity
-    """
-    disparity = compute_disparity(img_left, img_right)
-    focal = K[0,0]
+        # Configure acceleration plot
+        self.ax2.set_title("Ego Vehicle Acceleration")
+        self.ax2.set_ylabel("Acceleration magnitude (m/s²)")
+        self.acc_line, = self.ax2.plot([], [], label="Acceleration", color="r")
+        self.p_acc_line, = self.ax2.plot([], [], label="Planned Acceleration", color="g")
+        self.alimu_line, = self.ax2.plot([], [], label="Acceleration Limit (max)", color="y")
+        self.aliml_line, = self.ax2.plot([], [], label="Acceleration Limit (min., neg)", color="y")
+        self.ax2.legend()
 
-    # Replace all instances of 0 and -1 with a small minimum value (to avoid div by 0 or negatives)
-    disparity[disparity == 0] = 0.0001
-    disparity[disparity == -1] = 0.0001
+        # Configure throttle/brake plot
+        self.ax3.set_title("Ego Vehicle Brake/Throttle/opt-flag")
+        self.ax3.set_ylabel("Input Magnitude")
+        self.throttle_line, = self.ax3.plot([], [], label="Throttle", color="g")
+        self.brake_line, = self.ax3.plot([], [], label="Brake", color="r")
+        self.opt_flag_line, = self.ax3.plot([], [], label="Opt-flag", color="k")
+        self.ax3.legend()
 
-    # Initialize the depth map as an array of ones with the same shape as the disparity map
-    # data type is np.single (32-bit floating point)
-    depth = np.ones(disparity.shape, np.single)
-    depth = (focal * BASELINE) / disparity
-    return depth
+        # Configure heading plot
+        self.ax4.set_title("Ego Vehicle Heading")
+        self.ax4.set_ylabel("Heading (rad)")
+        # self.h_line, = self.ax4.plot([], [], label="Current heading", color="r")
+        # self.h_line_traj, = self.ax4.plot([], [], label="planned_traj.heading[0]", color="r")
+        self.p_h_line, = self.ax4.plot([], [], label="Planned heading", color="g")
+        self.ax4.legend()
 
-def extract_features(image):
-    """
-    Extracts keypoints and descriptors from an image
-
-    ORB: Oriented FAST and Rotated BRIEF feature detector and descriptor
-    """
-    # ORB detector initialized usinng ORB_create
-    orb = cv2.ORB_create(nfeatures=1500)
-
-    # Find the keypoints and descriptors with ORB
-    keypoints, descriptors = orb.detectAndCompute(image, None)
-
-    return keypoints, descriptors
-
-def match_features(descriptors1, descriptors2):
-    """
-    Matches features between two images
+        plt.grid()
     
-    BFMatcher: Brute Force Matcher
-    """
-    bfmatcher = cv2.BFMatcher()
-    matches = bfmatcher.knnMatch(descriptors1, descriptors2, k=2)
-    return matches
-
-def filter_matches_by_distance(matches, dist_threshold):
-    """
-    Filters matches by distance
-
-    matches: list of matched features from two images
-    dist_threshold: maximum allowed relative distance betwween the two matches: (0, 1)
-
-    filtered_matches: list of good matches, satisfying the distance threshold
-    """
-    filtered_matches = [match1 for match1, match2 in matches if match1.distance < (dist_threshold * match2.distance)]
-    # filtered_match = []
-    # for i, (match1, match2) in enumerate(matches):
-    #     if match1.distance < dist_threshold:
-    #         filtered_match.append(match1)
-
-    return filtered_matches
-
-def estimate_motion(matches, keypoints1, keypoints2, K, depth=None):
-    """
-    Estimates the relative motion (rotation and translation) between two consecutive frames
-    using matched keypoints and optionally depth information
+    def log_config(self):
+        self.simulation_log.set_config(self.config)
+        # if self.args.scenario is not None:
+        #     self.simulation_log.set_scenario_config(self.scenario.config)
     
-    Inputs:
-    - matches: a list of matches between keypoints in the two images
-    - keypoints1: keypoints in the first image
-    - keypoints2: keypoints in the second image
-    - K: camera intrinsic matrix
-    - depth: depth map for the first image (optional)
+    def check_and_load_map(self):
+        # TODO: Implement case for scenario
+        current_map = self.world.get_map().name
+        target_map = "Town05_Opt"
+
+        # If the current map is not "Town05_Opt", load it
+        if target_map not in current_map:
+            print(f"Current map is {current_map} and scenarios require Town05_Opt. Loading {target_map}...")
+            self.client.load_world(target_map)
+            print(f"{target_map} loaded successfully.")
     
-    Outputs:
-    - R: rotation matrix
-    - T: translation vector
-    """
-    # image_1_points and image_2_points are lists of 2D points in the first and second images, respectively
-    # object_points is a list of 3D points in the world coordinate system
-    image_1_points = []
-    image_2_points = []
-    object_points = []
-
-    for m in matches:
-        # Extract coordinates (u1, v1) of the keypoint in the first image
-        # Extract coordinates (u2, v2) of the keypoint in the second image
-        # .queryIdx: index of the keypoint in the first image
-        # .trainIdx: index of the keypoint in the second image
-        u1, v1 = keypoints1[m.queryIdx].pt
-        u2, v2 = keypoints2[m.trainIdx].pt
-
-        # Retrieve the depth value "s" at coordinates (u1, v1) from the depth map
-        s = depth[int(v1), int(u1)]
-
-        # If the depth value "s" is LESS than 1000:
-        if s < S_LIMIT:
-            # Compute the 3D point in the camera coordinate system using the formula:
-            # p_c = K^{-1} * (s * [u1, v1, 1]^T)
-            p_c = np.linalg.inv(K) @ (s * np.array([u1, v1, 1]))
-
-            # Append the 2D points and the computed 3D point to their respective lists
-            image_1_points.append(np.array([u1, v1]))
-            image_2_points.append(np.array([u2, v2]))
-            object_points.append(p_c)
-
-    # Estimate the relative motion between the two images using RANSAC
-    # Stack the 3D points into a single NumPy array
-    object_points = np.vstack(object_points)
-    # Convert the 2D points into a single NumPy array
-    image_points = np.array(image_2_points)
-    # Estimate the rotation (R_vec) and translation (T) between the two frames using 
-    # the PnP algorithm with RANSAC
-    _, R_vec, T, _ = cv2.solvePnPRansac(object_points, image_points, K, None)
-    # Using Rodrigues' formula, convert the rotation vector to a rotation matrix
-    R, _ = cv2.Rodrigues(R_vec)
-
-    return R, T
-
-def update_trajectory(prev_trajectory, prev_RT, matches, keypoints1, keypoints2, K, depth=None):
-    # Extract each column of prev_trajectory and store it as a list of 3D points
-    # Example:
-    # prev_trajectory = np.array([
-    #                            [1, 2, 3, 4],   # x-coordinates
-    #                            [5, 6, 7, 8],   # y-coordinates
-    #                            [9, 10, 11, 12] # z-coordinates
-    #                            ])
-    # trajectory = np.array([
-    #                       [1, 5, 9],  
-    #                       [2, 6, 10],  
-    #                       [3, 7, 11],  
-    #                       [4, 8, 12] 
-    #                       )
-    trajectory = [prev_trajectory[:,i] for i in range(prev_trajectory.shape[-1])]
-
-    # Estimate the relative motion (rotation and translation) between two frames
-    R, T = estimate_motion(matches, keypoints1, keypoints2, K, depth=depth)
-    # R = 3x3, T = 3x1
-
-    # Extrinsic matrix from previous frame (camera) to world frame
-    RT_prevframe_world = prev_RT
-
-    # Combine the rotation matrix (R) and translation vector (T) into a 4x4 transformation matrix
-    # Extrinsic matrix from previous frame (camera) to current frame (camera)
-    RT_prevframe_currframe = np.eye(4)
-    RT_prevframe_currframe = np.hstack([R, T])
-    RT_prevframe_currframe = np.vstack([RT_prevframe_currframe, np.array([0, 0, 0, 1])])
-
-    # Extrinsic matrix from current frame (camera) to world frame
-    RT_currframe_world = RT_prevframe_world @ np.linalg.inv(RT_prevframe_currframe)
-
-    # Calculate current camera position from origin
-    new_position = RT_currframe_world[:3,3]
+    def log_ego_attrs(self):
+        self.simulation_log.set_ego_id(self.ego.id)
+        self.simulation_log.set_global_plan(self.route)
     
-    new_trajectory = np.array([
-        new_position[2], 
-        -new_position[0],
-        new_position[1]  
-    ])
-
-    # Append the new 3D point to the trajectory
-    trajectory.append(new_trajectory[0:3])
-    # print("Trajectory: ", trajectory)
-
-    # Convert the trajectory from a list of 3D points to a NumPy array
-    trajectory = np.array(trajectory).T
-
-    return trajectory, RT_currframe_world
-
-def plot_trajectory(ax1, ax2, ax3, ax4, fig, trajectory_gt, trajectory_est):
-    plt.cla()
+    def setup_run(self):
+        # TODO: Implement case for scenario
+        self.setup_normal_run()
     
-    if PLOT_3D:
-        ax1.clear()
-        ax1.plot3D(trajectory_est[0, :], trajectory_est[1, :], trajectory_est[2, :], 'r', label = "Estimated")
-        ax1.scatter3D(trajectory_est[0, :], trajectory_est[1, :], trajectory_est[2, :], color = "r")
-        ax1.plot3D(trajectory_gt[0, :], trajectory_gt[1, :], trajectory_gt[2, :], 'b', label = "Ground Truth")
-        ax1.scatter3D(trajectory_gt[0, :], trajectory_gt[1, :], trajectory_gt[2, :], color = "b")
-        ax1.set_title("3D")
-        ax1.set_xlabel("X")
-        ax1.set_ylabel("Y")
-        ax1.set_zlabel("Z")
-        ax1.legend()
-    if PLOT_XY:
-        ax2.clear()
-        ax2.plot(trajectory_est[0, :], trajectory_est[1, :], 'r', label = "Estimated")
-        ax2.scatter(trajectory_est[0, :], trajectory_est[1, :], color = "r")
-        ax2.plot(trajectory_gt[0, :], trajectory_gt[1, :], 'b', label = "Ground Truth")
-        ax2.scatter(trajectory_gt[0, :], trajectory_gt[1, :], color = "b")
-        ax2.set_title("XY")
-        ax2.set_xlabel("X")
-        ax2.set_ylabel("Y")
-        ax2.legend()
-    if PLOT_XZ:
-        ax3.clear()
-        ax3.plot(trajectory_est[0, :], trajectory_est[2, :], 'r', label = "Estimated")
-        ax3.scatter(trajectory_est[0, :], trajectory_est[2, :], color = "r")
-        ax3.plot(trajectory_gt[0, :], trajectory_gt[2, :], 'b', label = "Ground Truth")
-        ax3.scatter(trajectory_gt[0, :], trajectory_gt[2, :], color = "b")
-        ax3.set_title("XZ")
-        ax3.set_xlabel("X")
-        ax3.set_ylabel("Z")
-        ax3.legend()
-    if PLOT_YZ:
-        ax4.clear()
-        ax4.plot(trajectory_est[1, :], trajectory_est[2, :], 'r', label = "Estimated")
-        ax4.scatter(trajectory_est[1, :], trajectory_est[2, :], color = "r")
-        ax4.plot(trajectory_gt[1, :], trajectory_gt[2, :], 'b', label = "Ground Truth")
-        ax4.scatter(trajectory_gt[1, :], trajectory_gt[2, :], color = "b")
-        ax4.set_title("YZ")
-        ax4.set_xlabel("Y")
-        ax4.set_ylabel("Z")
-        ax4.legend()
+    def setup_normal_run(self):
+        spawn_point = random.choice(self.world_model.map_gt.get_spawn_points())
+        self.route, self.spawn_point = generate_route(self.global_route_planner, self.world_model.map_gt, spawn_point, spawn_point, 200, ignore_destination=True)
+        self.run_name = "last"
+    
+    def spawn_vehicle_and_agent(self):
+        self.ego = spawn_vehicle(self.world, self.spawn_point, ego_vehicle=True, bp='vehicle.tesla.model3')
+        self.world_model.set_ego(self.ego)
+        self.setup_agent(self.config)
+        self.setup_collision_sensor()
+    
+    def setup_collision_sensor(self):
+        blueprint_library = self.world.get_blueprint_library()
+        self.collision_sensor = self.world.spawn_actor(blueprint_library.find('sensor.other.collision'), carla.Transform(), attach_to=self.ego)
+        self.collision_sensor.listen(lambda event: self.simulation_log.store_collision(event, self.current_frame))
 
-    fig.canvas.draw()
-    fig_img = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-    fig_img = fig_img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    cv2.imshow("Figure", cv2.cvtColor(fig_img, cv2.COLOR_RGB2BGR))
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    def check_logging_dir(self):
+        # if logging directoring does not exist, create it
+        if not os.path.exists(self.config["logging"]["directory"]):
+            os.makedirs(self.config["logging"]["directory"])
+
+    def setup_recorder(self):
+        self.client.start_recorder(
+            os.path.join(self.config["logging"]["directory"], f"{self.run_name}.log"),
+            self.config["logging"]["additional_data"]
+        )
+
+    # def setup_birds_eye_camera(self, config):
+    #     self.birds_eye_camera = None
+    #     self.latest_image = None  # Global variable to store the latest image
+    #     if config['active']:
+    #         self.birds_eye_camera = setup_birds_eye_camera(self.ego, config)
+    #         self.birds_eye_camera.listen(lambda image: keep_latest_image(image, self, 'latest_image'))
+
+    def setup_agent(self, config):
+        # self.agent = AVAgent(self.ego, config, world_model=self.world_model)
+        ##self.setup_navigation()
+
+        # ToDo: Add MPCAgent instantiation within AVAgent, so CARLA and Custom agents are interfaced uniformly.
+        if self.config["agent"]["name"] == "Custom":
+            self.agent = MPCAgent(self.ego, config, world_model=self.world_model, route=self.route,
+                                  destination=self.ego_destination)
+
+    def setup_navigation(self):
+        # Set the agent destination
+        self.spawn_points = self.world_model.map_gt.get_spawn_points()
+        self.ego_destination = random.choice(self.spawn_points).location
+
+    def update_spectator(self):
+        if self.config['misc']['spectator_follows_ego']:
+            transform = self.ego.get_transform()
+            # transform = self.scenario.others[0].get_transform()
+            self.spectator.set_transform(
+                carla.Transform(transform.location + carla.Location(z=self.config["misc"]["spectator_z"]),
+                                carla.Rotation(pitch=-90)))
+
+    def draw_planned_route(self, max_waypoints=1000):
+        # waypoints_list = self.agent.get_planned_route(max_waypoints)
+        # draw_waypoints_II(self.world, waypoints_list, life_time=self.config["visualization"]["debug"]["life_time"])
+        points_list = self.agent.get_planned_route(max_waypoints)
+        draw_points(self.world, points_list, life_time=self.config["visualization"]["debug"]["life_time"])
+
+    def draw_global_route(self):
+        route = [wp[0] for wp in self.route][::50]
+        draw_waypoints(self.world, route, life_time=self.config["visualization"]["debug"]["life_time"],
+                       color=carla.Color(0, 255, 0, 125))
+
+    def draw_predictions(self, max_points=100, downsampler=5):
+        color = carla.Color(0, 0, 255, 125)
+        for actor_id, predictions in self.world_model.predictions.items():
+            for prediction in predictions:
+                prediction_points = prediction[:max_points:downsampler]
+                prediction_headings = prediction.get_heading()[:max_points:downsampler]
+                draw_points(self.world, prediction_points, life_time=self.config["visualization"]["debug"]["life_time"],
+                            color=color, headings=prediction_headings)
+
+    def misc_updates(self):
+        self.update_spectator()
+        self.fps, self.frame_count, self.start_time = update_fps(self.frame_count, self.start_time,
+                                                                 last_fps=self.fps)  # Calculate FPS
+        self.world_model.update()
+
+    def visualize(self):
+        self.draw_global_route()
+        self.draw_predictions()
+
+        if self.config["visualization"]["world"]["active"]:
+            draw_world(self.world_model, self.ego.id, self.fps)  # Draw the world
+
+        if self.config['visualization']['birds_eye_camera']['active']:
+            # Display the image using OpenCV
+            if self.latest_image is not None:
+                # cv works on bgr(a) instead of rgb(a), so we swap axis 0 and 2
+                img = self.latest_image[..., [2, 1, 0]]
+                cv2.imshow('Bird\'s Eye View', img)
+                cv2.waitKey(1)
+
+        if self.config["visualization"]["debug"]["live_ego_plots"]:  # ToDo:  move to visualization.py
+            velocity = self.agent.get_ego_velocity()
+            heading = self.agent.get_ego_heading(rad=True)
+            acceleration = self.agent.get_ego_acceleration()
+
+            throttle = self.agent.throttle
+            brake = self.agent.brake
+            if self.config["agent"]["name"] == "Custom":
+                planned_vel = self.agent.planned_traj.v[1]
+                planned_heading = self.agent.planned_traj.heading[1]
+                planned_acc = self.agent.planned_traj.a[1]
+
+                if self.agent.opt_flag == True:
+                    opt_flag = 1
+                else:
+                    opt_flag = 0
+
+            # Append data for plotting
+            self.time_data.append(self.idx)
+            self.vel_data.append(velocity)
+            self.h_data.append(heading)
+            self.acc_data.append(acceleration)
+            self.throttle_data.append(throttle)
+            self.brake_data.append(brake)
+            if self.config["agent"]["name"] == "Custom":
+                self.p_vel_data.append(planned_vel)
+                self.p_h_data.append(planned_heading)
+                self.p_acc_data.append(planned_acc)
+                self.opt_flag_data.append(opt_flag)
+
+            # Update the plot data
+            self.vel_line.set_data(self.time_data, self.vel_data)
+            self.acc_line.set_data(self.time_data, self.acc_data)
+            self.throttle_line.set_data(self.time_data, self.throttle_data)
+            self.brake_line.set_data(self.time_data, self.brake_data)
+            if self.config["agent"]["name"] == "Custom":
+                self.p_vel_line.set_data(self.time_data, self.p_vel_data)
+                self.p_h_line.set_data(self.time_data, self.p_h_data)
+                self.p_acc_line.set_data(self.time_data, self.p_acc_data)
+                self.opt_flag_line.set_data(self.time_data, self.opt_flag_data)
+
+            self.vliml_line.set_data(self.time_data, np.abs(self.config["planner"]["v_min"]))
+            self.aliml_line.set_data(self.time_data, np.abs(self.config["planner"]["a_min"]))
+            self.alimu_line.set_data(self.time_data, np.abs(self.config["planner"]["a_max"]))
+
+            # Adjust plot limits to fit new data
+            self.ax1.relim()
+            self.ax1.autoscale_view()
+            self.ax2.relim()
+            self.ax2.autoscale_view()
+            self.ax3.relim()
+            self.ax3.autoscale_view()
+            self.ax4.relim()
+            self.ax4.autoscale_view()
+
+            # Redraw the plot
+            plt.pause(0.01)
+            self.idx += 1
+
+    def log_times(self):
+        iterables = [
+            ("Perception", self.dt_perceive),
+            ("Prediction", self.dt_predict),
+            ("Planning", self.dt_plan),
+            ("Control", self.dt_control),
+            ("Viz", self.dt_viz),
+            ("Other", self.dt_other),
+            ("Tick", self.dt_tick)
+        ]
+
+        msg = f'\rFPS: {1.0 / self.iteration_time:.2f}'
+        for (name, t) in iterables:
+            msg += f" | {name}: {100 * t / self.iteration_time:.1f}%"
+        sys.stdout.write(msg)
+
+    def log_simulation_step(self):
+        # print("skipping logging for now")
+        self.simulation_log.store_actors(self.world_model, self.current_frame)
+        self.simulation_log.store_predictions(self.world_model, self.current_frame)
+        self.simulation_log.store_plan(self.world_model, self.current_frame)
+        self.simulation_log.store_optimization_time(self.agent, self.current_frame)
+        self.simulation_log.store_control(self.world_model, self.current_frame)
+        self.simulation_log.store_feasibility(self.agent, self.current_frame)
+
+    def check_timeout(self):
+        total_time = time.time() - self.simulation_start_time
+        # should_raise_error = self.args.scenario is not None and total_time >= self.config["misc"]["scenario_timeout"]
+        # if should_raise_error:
+        #     raise TimeoutError("Scenario timed out.")
+
+    def check_stuck(self):
+        current_x = self.ego.get_transform().location.x
+        current_y = self.ego.get_transform().location.y
+        current_z = self.ego.get_transform().location.z
+
+        if self.last_ego_position is None:
+            self.last_ego_position = (current_x, current_y)
+            return
+
+        last_x, last_y = self.last_ego_position
+
+        if self.wait_counter == 0 and current_x == last_x and current_y == last_y:
+            self.stuck_counter += 1
+        else:
+            self.stuck_counter = 0
+
+        self.last_ego_position = (current_x, current_y)
+        if self.wait_counter == 0:
+            print("Ego position: ", current_x, current_y, current_z)
+
+        if np.abs(current_z) >= self.config["misc"]["z_lim"]:
+            msg = "Ego seems to be flying or falling"
+            print(msg)
+            raise TimeoutError(msg)
+
+        if self.stuck_counter >= self.config["misc"]["stuck_counter_threshold"]:
+            msg = "TimeOut. Ego vehicle seems stuck."
+            print(msg)
+            raise TimeoutError(msg)
+        
+    def setup_birds_eye_camera(self, config):
+        self.birds_eye_camera = None
+        self.latest_image = None  # Global variable to store the latest image
+        if config['active']:
+            self.birds_eye_camera = setup_birds_eye_camera(self.ego, config)
+            self.birds_eye_camera.listen(lambda image: keep_latest_image(image, self, 'latest_image'))
+
+    def run(self):
+        # Let the vehicles settle after spawning
+        M = 20
+        for _ in range(M):
+            # make sure the spectator is where the ego is on the first frame
+            self.update_spectator()  
+
+            # Save all the actors, timestemp
+            self.world_model.update()
+            self.world.tick()
+
+        dt0 = time.time()
+        prev_a = 0
+        self.idx = 0
+        while True:
+            # If we're simulating a scenario, check if the timeout has been reached
+            self.check_timeout()  
+
+            # Based on our self.stuck_counter and our configged stuck_counter_threshold...
+            # Checks if we're stuck (distanced based)
+            self.check_stuck()
+
+            # Update spectator, FPS, world_model
+            dt = time.time()
+            self.misc_updates()
+            self.dt_other = time.time() - dt  # time spent with other simulation updates
+
+            # For now... update actors and map with ground truth
+            dt = time.time()
+            self.agent.perceive()
+            self.dt_perceive = time.time() - dt  # time spent in perception
+
+            # Loads a prediction model based on what's configged
+            # 
+            dt = time.time()
+            self.agent.predict()
+            self.dt_predict = time.time() - dt  # time spent in prediction
+            # print(f"Total time spent predicting: {self.dt_predict:.5f} sec")
+
+            if self.wait_counter == 0:  # otherwise currently waiting. Do not plan or control ego
+                dt = time.time()
+                # pdb.set_trace()
+                self.agent.u_prev_prev = [np.copy(self.agent.u_prev[0]), np.copy(self.agent.u_prev[1])]
+                self.agent.plan()
+                if self.config['agent']['name'] == "Custom":  # Carla agents do not have this attribute
+                    self.draw_planned_route()
+                self.dt_plan = time.time() - dt  # time spent in planning
+
+                dt = time.time()
+                # pdb.set_trace()
+                try:
+                    self.agent.control()
+                except IndexError:
+                    print("Warning: Control failed due to infeasible trajectory. Stopping vehicle.")
+                    self.ego.set_target_velocity(carla.Vector3D(x=0, y=0, z=0))
+                    continue
+            else:  # keep stopped
+                current_transform = self.ego.get_transform()
+                self.ego.set_transform(current_transform)
+                self.ego.set_target_velocity(carla.Vector3D(x=0, y=0, z=0))
+
+            NUM = 10
+            DEC = 4
+            print("")
+            print("[main.py] self.agent.planned_traj.x", np.round(self.agent.planned_traj.x[:NUM], decimals=DEC))
+            print("[main.py] self.agent.planned_traj.y", np.round(self.agent.planned_traj.y[:NUM], decimals=DEC))
+            print("[main.py] self.agent.planned_traj.a", np.round(self.agent.planned_traj.a[:NUM], decimals=DEC))
+            print("[main.py] self.agent.planned_traj.df", np.round(self.agent.planned_traj.df[:NUM], decimals=DEC))
+            print("[main.py] np.diff(self.agent.planned_traj.a)",
+                  np.round(np.diff(self.agent.planned_traj.a)[:NUM], decimals=DEC))
+            print("[main.py] np.diff(self.agent.planned_traj.df)",
+                  np.round(np.diff(self.agent.planned_traj.df)[:NUM], decimals=DEC))
+            print("[main.py] u_prev_prev[0] - u_prev[0]",
+                  np.round(self.agent.u_prev_prev[0] - self.agent.u_prev[0], decimals=DEC))
+            print("[main.py] u_prev_prev[1] - u_prev[1]",
+                  np.round(self.agent.u_prev_prev[1] - self.agent.u_prev[1], decimals=DEC))
+
+            # if (self.agent.done() or self.scenario_done) and self.scenario is not None:
+            #     self.scenario_done = True
+            #     if self.wait_counter == 0:
+            #         print(
+            #             f"Scenario finished successfully. Waiting for {self.config['misc']['wait_after_scenario']} frames and exiting..")
+
+            #     if self.wait_counter >= self.config["misc"]["wait_after_scenario"]:
+            #         break
+
+            #     if self.wait_counter % 10 == 0:
+            #         print(f"Waiting frames left: {self.config['misc']['wait_after_scenario'] - self.wait_counter}...")
+            #     self.wait_counter += 1
+            #     time.sleep(0.05)
+
+            # elif self.agent.done() and self.config['agent']['loop']:  # roam around indefinitely
+            #     print("reached destination. Setting new destination")
+            #     self.agent.set_destination(random.choice(self.spawn_points).location)
+            if self.agent.done() and self.config['agent']['loop']:  # roam around indefinitely
+                print("reached destination. Setting new destination")
+                self.agent.set_destination(random.choice(self.spawn_points).location)
+
+            # Apply control to other agents in scenario
+            # if self.scenario is not None:
+            #     self.scenario.run_step()
+            self.dt_control = time.time() - dt  # time spent in control
+
+            dt = time.time()
+            self.log_simulation_step()
+            self.dt_other += time.time() - dt  # time spent with other simulation updates
+
+            dt = time.time()  # ToDo: Add visualization options as optional in config
+            self.visualize()
+            self.dt_viz = time.time() - dt  # time spent visualizing stuff
+
+            current_time = time.time() - dt0
+
+            dt = time.time()
+            self.world.tick()  # Advance the simulation to the next frame
+            self.dt_tick = time.time() - dt
+
+            self.iteration_time = time.time() - dt0
+            if self.config["misc"]["show_time_on_console"]:
+                self.log_times()
+            dt0 = time.time()
+            self.current_frame += 1
+            self.counter += 1
+
+            print("=============================================================")
+            print("=============================================================")
+
+        self.simulation_log.store_timeout(False)
+
+    def _try_destroy_actor(self, actor):
+        try:
+            actor.destroy()
+        except AttributeError:
+            print("Tried to destroy 'other', but did not exist.")
+
+    def cleanup(self):
+        self.settings.synchronous_mode = False  # Disable synchronous mode before exiting
+        self.world.apply_settings(self.settings)
+        self.ego.destroy()
+
+        # if self.scenario is not None:
+        #     for other in self.scenario.others:
+        #         self._try_destroy_actor(other)
+
+        if hasattr(self, 'other'):
+            self._try_destroy_actor(self.other)
+
+        if self.config['visualization']['birds_eye_camera']['active'] and self.birds_eye_camera is not None:
+            self.birds_eye_camera.stop()  # Stop the camera from listening to new images
+            self.birds_eye_camera.destroy()  # Remove the camera from the simulation
         cv2.destroyAllWindows()
 
-def main():
+    def destroy_all_vehicles(self):
+        try:
+            settings = self.world.get_settings()
+            if settings.synchronous_mode:
+                self.world.tick()
+
+            # Get all actors in the world
+            actors = self.world.get_actors()
+
+            # Filter actors to get only vehicles
+            vehicles = actors.filter('vehicle.*')
+
+            if vehicles:
+                print(f"Destroying {len(vehicles)} vehicles")
+                for vehicle in vehicles:
+                    vehicle.destroy()
+            else:
+                print("No vehicles found in the simulation.")
+
+        except Exception as e:
+            print(f"An error occurred: {e}")
+
+def try_run(args):
+    simulation = Simulation(args)
+    should_hang = False
     try:
-        waypoint = world.get_map().get_waypoint(spawn_point.location)
-
-        # Transformation matrix from world coordinates to camera coordinates
-        world2camera = np.array(left_camera.get_transform().get_inverse_matrix())
-
-        # Ground truth (actual) trajectory
-        trajectory_gt = left_camera.get_location()
-        trajectory_gt = np.array([trajectory_gt.x, trajectory_gt.y, trajectory_gt.z]).reshape((3,1))
-
-        # Estimated trajectory from visual odometry
-        trajectory_est = np.array([0, 0, 0]).reshape((3,1))
-        R = np.diag([1, 1, 1])
-        T = trajectory_est
-
-        # RT: 4x4 transformaton matrix combining rotation (R) and translation (T)
-        RT = np.hstack([R, T])
-        RT = np.vstack([RT, np.array([0, 0, 0, 1])])
-
-        # Initialize old_frame to store the previous frame for feature matching
-        old_frame = None
-
-        # Initialize a matplotlib figure with four subplots
-        # ax1: 3D plot for visualizing the trajectory
-        # ax2: 2D plot for the XY-plane
-        # ax3: 2D plot for the XZ-plane
-        # ax4: 2D plot for the YZ-plane
-        if NUM_PLOTS > 0:
-            fig = plt.figure(figsize=(15,4))
-        else:
-            fig = plt.figure()
-        
-        ax1, ax2, ax3, ax4 = None, None, None, None
-        plot_counter = 1
-        if PLOT_3D:
-            ax1 = fig.add_subplot(1, NUM_PLOTS, plot_counter, projection='3d')
-            plot_counter += 1
-        if PLOT_XY:
-            ax2 = fig.add_subplot(1, NUM_PLOTS, plot_counter)
-            ax2.set_aspect('equal', adjustable='box')
-            plot_counter += 1
-        if PLOT_XZ:
-            ax3 = fig.add_subplot(1, NUM_PLOTS, plot_counter)
-            ax3.set_aspect('equal', adjustable='box')
-            plot_counter += 1
-        if PLOT_YZ:
-            ax4 = fig.add_subplot(1, NUM_PLOTS, plot_counter)
-            ax4.set_aspect('equal', adjustable='box')
-
-        left_frame = None
-        right_frame = None
-        curr_frame = None
-
-        # Main loop
-        while True:
-            world.tick()
-            waypoint = np.random.choice(waypoint.next(1))
-            vehicle.set_transform(waypoint.transform)
-            # Current ground truth location
-            trajectory_gt_curr = left_camera.get_location()
-            trajectory_gt = np.hstack([trajectory_gt, 
-                                       np.array([trajectory_gt_curr.x, 
-                                                 trajectory_gt_curr.y, 
-                                                 trajectory_gt_curr.z]).reshape((3,1))])
-            left_frame = camera_data['left'].copy()
-            right_frame = camera_data['right'].copy()
-            # If both frames are available:
-            if (left_frame is not None) and (right_frame is not None):
-                curr_frame = left_frame.copy()
-                if SHOW_LR_CAMERAS:
-                    cv2.imshow("Left Frame", left_frame)
-                    cv2.imshow("Right Frame", right_frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        cv2.destroyAllWindows() 
-                        break
-                depth = calculate_depth(left_frame, right_frame, K)
-            if old_frame is not None:
-                keypoints1, descriptors1 = extract_features(old_frame)
-                keypoints2, descriptors2 = extract_features(curr_frame)
-                matches = match_features(descriptors1, descriptors2)
-                matches = filter_matches_by_distance(matches, dist_threshold=0.6)
-
-                if VISUALIZE_MATCHES:
-                    # Match features of current frame and previous frame of Left Camera
-                    image_matches = cv2.drawMatches(old_frame, keypoints1, curr_frame, keypoints2, matches, None)
-
-                    scale_percent = 70 # Resize to scale_percent% of original size
-                    im_width = int(image_matches.shape[1] * scale_percent / 100)
-                    im_height = int(image_matches.shape[0] * scale_percent / 100)
-
-                    resized_image_matches = cv2.resize(image_matches, (im_width, im_height), interpolation=cv2.INTER_AREA)
-                    cv2.imshow("Matches", resized_image_matches)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        cv2.destroyAllWindows()
-                        break
-
-                # Update trajectory
-                trajectory_est, RT = update_trajectory(trajectory_est, RT, matches, keypoints1, keypoints2, K, depth=depth)
-
-                # Map the ground truth trajectory to the camera coordinate system
-                # 1. Append a row of 1s to the ground truth trajectory to make it homogeneous
-                trajectory_gt_world = np.append(trajectory_gt, np.ones((1, trajectory_gt.shape[1])), axis=0)
-                # 2. Multiply by world2camera to transform the ground truth trajectory to the camera coordinate system
-                trajectory_gt_camera = world2camera @ trajectory_gt_world
-                # 3. Rearrange the coordinates to match the camera's coordinate system
-                trajectory_gt_camera = np.array([trajectory_gt_camera[0], 
-                                                 -trajectory_gt_camera[1], 
-                                                 trajectory_gt_camera[2]])
-                
-                # Plot trajectory
-                if SHOW_PLOTS:
-                    plot_trajectory(ax1, ax2, ax3, ax4, fig, trajectory_gt_camera, trajectory_est)
-
-                # Normalize the depth map for visualization and display it
-                depth = ((depth - depth.mean()) / depth.std()) * 255
-                depth = depth.astype(np.uint8)
-                
-                # Show depth map
-                if SHOW_DEPTHS:
-                    cv2.imshow("Depth", depth)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        cv2.destroyAllWindows()
-                        break
-            # Update old_frame with the current frame for the next iteration
-            if curr_frame is not None:
-                old_frame = curr_frame.copy()
-    except Exception as e:
-        print("Error:", e)
-        traceback.print_exc()
+        simulation.run()
+    except KeyboardInterrupt:
+        print("Exiting due to keyboard interrupt")
+        simulation.simulation_log.store_timeout(False)
+    except TimeoutError as e:
+        print(f"Timed out")
+        simulation.simulation_log.store_timeout(True)
+        should_hang = True  # halt process after finally (to make sure we save logs and such), and then wait for parent process to kill this due to timeout
     finally:
-        # Destroy all actors
-        for actor in actors:
-            actor.destroy()
-                
-main()
+        # save cached roadgraph idxs, if they exist
+        if hasattr(simulation.agent.predictor, "renderer"):
+            renderer = simulation.agent.predictor.renderer
+            savefile = os.path.join(PROJECT_DIR, decouple.config("CACHE_DIR"), renderer.CACHED_RG_FILTER_NAME + ".pkl")
+            with open(savefile, "wb") as f:
+                pickle.dump(renderer.cached_rg_idxs, f)
+
+        simulation_time = time.time() - simulation.simulation_start_time  # Real time in seconds that the simnulation was running
+        simulation.simulation_log.store_simulation_time(simulation_time)
+        simulation.cleanup()
+        simulation.client.stop_recorder()
+        simulation.simulation_log.save(simulation.config['logging']['directory'], simulation.run_name,
+                                       simulation.world_model)
+        if should_hang:
+            print(
+                f"Hanging for {simulation.config['misc']['scenario_timeout_slack']} seconds. Waiting to be killed, or finish hanging.")
+            time.sleep(simulation.config['misc']['scenario_timeout_slack'])
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    # scenario_options = []
+    # scenario_config_files = os.listdir(os.path.join(PROJECT_DIR, "src/scenario/config"))
+    # for scenario_config_file in scenario_config_files:
+    #     scenario_options.append(scenario_config_file.split("_")[0])
+    #     scenario_options.append(scenario_config_file)
+
+    # parser.add_argument(
+    #     '-sc', '--scenario',
+    #     type=str,
+    #     default=None,
+    #     help="Scenario to be played. Options: scX where X=scenario number",
+    #     choices=sorted(scenario_options)
+    # )
+
+    # parser.add_argument("-a", "--all", action="store_true", help="Evaluate all scenarios")
+
+    args = parser.parse_args()
+    return args
+
+if __name__ == "__main__":
+    args = parse_args()
+    try_run(args)
+
+    # if args.all:
+    #     raise NotImplementedError()  # Not functional yet
+    #     all_scenarios = utils.get_all_scenario_filenames(remove_extension=False)
+    #     print("Simulating all scenarios:", all_scenarios)
+
+    #     for scenario in all_scenarios:
+    #         print("Simulating", scenario)
+    #         args.run_name = scenario
+
+    #         try_run(args)
+
+    # else:
+    #     try_run(args)

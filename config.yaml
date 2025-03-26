@@ -1,0 +1,82 @@
+server:
+  host: 'localhost'
+  port: 2000
+  timeout: 10 # seconds
+  fps: 10
+
+planner:
+  model: MPCPlanner
+  alias: MPC
+  N: 60 #79 # prediction horizon
+  dt: 0.1 # sampling time
+
+  ca_radius: 2.2 # collision avoidance radius
+  detection_radius: 200
+
+  v_des: 5 # (m/s) desired velocity
+
+  nx: 7 # number of states
+  nu: 2 # number of inputs
+
+  steering_rate_limit: 1 # rad/s
+  jerk_limit: 5.0 # m/s^3
+  v_min: -1
+  v_max: 11.11
+  a_min: -6
+  a_max: 2
+  ey_lim: 1
+  epsi_lim: 1
+  a_lat_max: 5
+  max_steering: 1 # rad
+
+  num_obstacles: 0 # max number of obstacles considered by the planner
+  num_modes_per_vehicle: 2 
+  obstacle_filtering: probability # [distance, probability]
+
+  control: Perfect # [Ackermann, Perfect]
+  
+  longitudinal_control: PID # [PID, ALC]
+  lateral_control: PID # [BangBang, PID, PurePursuit, Stanley, POP]
+
+prediction:
+  model: ConstantVelocity # [ConstantVelocity, MultiModalConstantVelocity, MultiPathPP]
+  alias: CV
+  predict_ego: False # whether to make predictions for the ego vehicle
+  predict_heading: False # most predictors only output 2D predictions. If this is true, theta will be computed from it
+  predict_z: True # most predictors only output 2D predictions. If this is true, z will be predicted or kept from current z
+  prediction_horizon: 8 # in seconds
+  prediction_step: 0.1 # in seconds
+  n_trajectories: 6 # applicable to multimodal predictions
+
+visualization:
+  world:
+    active: True
+  birds_eye_camera: # setup a camera following the ego vehicle, display on separate openCV window
+    active: False
+    image_size_x: 800
+    image_size_y: 600
+    fov: 90
+    z: 50
+  debug:
+    live_ego_plots: False
+    life_time: 0.2
+
+logging:
+  additional_data: True
+
+agent:
+  name: Custom
+  loop: True
+
+misc:
+  spectator_follows_ego: True # Spectator follows ego from the top
+  spectator_z: 50
+  show_time_on_console: True # Share of computation time spent on each task (visualization, planning, perception, prediction, etc...) is shown on console
+  
+  scenario_timeout: 150000 # Seconds. If the scnenario does not complete within this time, save log and stop
+  scenario_timeout_slack: 10 # Seconds
+  stuck_counter_threshold: 50
+
+  z_lim: 15
+  wait_after_scenario: 80 # frames to wait after the scenario finishes in order to avoid sudden cuts of long horizon metrics like minFDE@8s
+  
